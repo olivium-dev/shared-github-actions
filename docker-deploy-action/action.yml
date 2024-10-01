@@ -1,0 +1,43 @@
+name: 'Docker Deployment'
+description: 'Builds, pushes, and deploys a Docker image to a server'
+inputs:
+  registry:
+    description: 'Docker registry URL'
+    required: true
+    default: 'ghcr.io'
+  image_name:
+    description: 'Docker image name'
+    required: true
+  service_name:
+    description: 'Service name for deployment'
+    required: true
+  internal_port:
+    description: 'Internal port of the service'
+    required: true
+  external_port:
+    description: 'External port of the service'
+    required: true
+  server_user:
+    description: 'Username for server access'
+    required: true
+  server_host:
+    description: 'Server host for SSH'
+    required: true
+  server_ssh_private_key:
+    description: 'SSH private key for server access'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - run: bash deploy-script.sh
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image_name }}
+        SERVICE_NAME: ${{ inputs.service_name }}
+        INTERNAL_PORT: ${{ inputs.internal_port }}
+        EXTERNAL_PORT: ${{ inputs.external_port }}
+        SERVER_USER: ${{ inputs.server_user }}
+        SERVER_HOST: ${{ inputs.server_host }}
+        SERVER_SSH_PRIVATE_KEY: ${{ inputs.server_ssh_private_key }}
