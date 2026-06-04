@@ -17,10 +17,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: actionlint
-        uses: raven-actions/actionlint@3a24062651993d40fed1019b58ac6fbdfbf276cc # v2.0.1
-        with:
-          fail-on-error: true
+      - name: Install + run actionlint (direct binary; avoids wrapper bundling bugs)
+        run: |
+          set -euo pipefail
+          VER="1.7.7"
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz" \
+            | tar -xz actionlint
+          ./actionlint -color
+          echo "actionlint v${VER}: no findings"
 
   shellcheck:
     runs-on: ubuntu-22.04
