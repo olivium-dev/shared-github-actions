@@ -1,0 +1,203 @@
+name: 'Jeeb migrate-then-start (pre-start DB migrate)'
+description: >-
+  OPT-IN, idempotent pre-start database migration for the Jeeb single-node Swarm.
+  Generalises the JEB-1490 ad-hoc psql step (user-management + push-notification)
+  into one reusable, language-agnostic action. Applies an idempotent SQL
+  migration to the NATIVE host Postgres over the caller's already-established
+  cloudflared SSH `Host` alias, BEFORE `docker service update`, then runs a
+  readiness check that FAILS THE DEPLOY on an absent column/table (fail-closed).
+  No-op when `run_migrations` is not 'true'. NEVER auto-migrates from app startup.
+#
+# WHERE THIS RUNS IN THE CALLER WORKFLOW
+#   checkout -> build/push image -> [SSH setup: writes ~/.ssh/config Host <ssh_host_alias>]
+#     -> THIS ACTION (pre-start migrate) -> docker service update/create -> health gate
+#
+#   The caller MUST have already written an SSH config alias (default `jeeb`) whose
+#   ProxyCommand is `cloudflared access ssh --hostname %h`. This action reuses that
+#   same-job alias; it does not (re)establish the tunnel itself, because the migrate
+#   must run in the SAME job that holds the SSH key + cloudflared config. (A reusable
+#   *workflow* would run in a separate runner and could not see that config — which is
+#   why this is a composite action, not a workflow_call.)
+#
+# OPT-IN: a service that has no schema to migrate simply omits `run_migrations`
+# (or sets it to 'false') and this action is a clean no-op.
+
+inputs:
+  run_migrations:
+    description: "Master opt-in switch. The action is a no-op unless this is exactly 'true'."
+    required: false
+    default: 'false'
+  ssh_host_alias:
+    description: "The in-job SSH config alias the caller already wrote (ProxyCommand = cloudflared)."
+    required: false
+    default: 'jeeb'
+  migrations_path:
+    description: >-
+      Repo-relative path to the migration SQL. Either a single .sql FILE
+      (e.g. Migrations/migrations.sql — the user-management shape) or a
+      DIRECTORY of *.sql files applied in sorted (lexical) order
+      (e.g. migrations/ — the push-notification shape).
+    required: true
+  db_host:
+    description: "Native host Postgres host (private LAN IP; never 127.0.0.1 from a container)."
+    required: true
+  db_port:
+    description: "Native host Postgres port."
+    required: false
+    default: '5432'
+  db_name:
+    description: "Target database name on the native host."
+    required: true
+  db_user:
+    description: "Database user (least-priv migrate role preferred)."
+    required: true
+  db_password:
+    description: "Database password. Passed via env -> PGPASSWORD on the remote; never echoed."
+    required: true
+  readiness_table:
+    description: >-
+      Table whose presence/column is asserted AFTER migrate. The deploy FAILS
+      if the expected column (or, if no column given, the table) is absent.
+    required: true
+  readiness_column:
+    description: >-
+      Column that MUST exist on readiness_table after migrate (the fail-fast
+      assertion that the schema reached head). Omit to assert the table only.
+    required: false
+    default: ''
+  readiness_schema:
+    description: "Schema of the readiness table (information_schema.table_schema)."
+    required: false
+    default: 'public'
+
+runs:
+  using: 'composite'
+  steps:
+    # ---------------------------------------------------------------------------
+    # GUARD 1 — opt-in. No-op (and DON'T touch the DB) unless explicitly enabled.
+    # GUARD 2 — fail the run if any REQUIRED secret/input is unset. Never fall
+    #           back to a literal (locked secrets rule). An empty db_password etc.
+    #           aborts here, before any remote connection is attempted.
+    # ---------------------------------------------------------------------------
+    - name: Pre-start migrate (idempotent, fail-closed)
+      shell: bash
+      env:
+        RUN_MIGRATIONS: ${{ inputs.run_migrations }}
+        SSH_ALIAS:      ${{ inputs.ssh_host_alias }}
+        MIG_PATH:       ${{ inputs.migrations_path }}
+        DB_HOST:        ${{ inputs.db_host }}
+        DB_PORT:        ${{ inputs.db_port }}
+        DB_NAME:        ${{ inputs.db_name }}
+        DB_USER:        ${{ inputs.db_user }}
+        DB_PASS:        ${{ inputs.db_password }}
+        READY_TABLE:    ${{ inputs.readiness_table }}
+        READY_COLUMN:   ${{ inputs.readiness_column }}
+        READY_SCHEMA:   ${{ inputs.readiness_schema }}
+      run: |
+        set -euo pipefail
+
+        if [ "${RUN_MIGRATIONS}" != "true" ]; then
+          echo "run_migrations != 'true' -> skipping pre-start migrate (no-op)."
+          exit 0
+        fi
+
+        # Fail-closed required-input check. NEVER substitute a literal/default secret.
+        : "${SSH_ALIAS:?ssh_host_alias is required}"
+        : "${MIG_PATH:?migrations_path is required}"
+        : "${DB_HOST:?db_host secret is required for the migrate step (unset -> fail, no literal fallback)}"
+        : "${DB_PORT:?db_port is required}"
+        : "${DB_NAME:?db_name is required}"
+        : "${DB_USER:?db_user secret is required for the migrate step}"
+        : "${DB_PASS:?db_password secret is required for the migrate step}"
+        : "${READY_TABLE:?readiness_table is required (the fail-fast assertion target)}"
+
+        # Resolve the migration source: a single .sql FILE or a DIRECTORY of *.sql.
+        SRC="${GITHUB_WORKSPACE}/${MIG_PATH}"
+        if [ -f "$SRC" ]; then
+          MODE="file"
+        elif [ -d "$SRC" ]; then
+          MODE="dir"
+          if ! ls "$SRC"/*.sql >/dev/null 2>&1; then
+            echo "::error::migrations_path '${MIG_PATH}' is a directory but contains no *.sql files."
+            exit 1
+          fi
+        else
+          echo "::error::migrations_path '${MIG_PATH}' resolves to neither a file nor a directory ($SRC)."
+          exit 1
+        fi
+        echo "Migrate source: ${MIG_PATH} (mode=${MODE})"
+
+        # Stream the migration tree to the host over the SAME cloudflared SSH alias.
+        # The native Postgres lives on the host's private LAN, reachable only from the
+        # host shell — so psql runs THERE, not on the runner. We pack the .sql into a
+        # tar on stdin; the remote driver script is delivered base64-encoded so nested
+        # quoting can't corrupt it and the password (PGPASSWORD env) never hits argv.
+        if [ "$MODE" = "file" ]; then
+          TAR_DIR="$(dirname "$SRC")"; TAR_ENTRY="$(basename "$SRC")"
+        else
+          TAR_DIR="$SRC"; TAR_ENTRY="."
+        fi
+
+        # Remote driver: build DSN, capture rollback marker, apply, readiness-check.
+        # ON_ERROR_STOP=1 => any failure aborts the deploy BEFORE the image rolls.
+        read -r -d '' REMOTE_SCRIPT <<'REMOTE' || true
+        set -euo pipefail
+        umask 077
+        WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+        tar -C "$WORK" -xzf -
+
+        export PGPASSWORD="$DB_PASS"
+        # libpq keyword DSN: no URL-encoding needed, password is in PGPASSWORD not the DSN.
+        DSN="host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} sslmode=prefer"
+
+        # Rollback marker: snapshot the readiness target's current columns pre-migrate.
+        echo "== rollback marker (pre-migrate ${READY_SCHEMA}.${READY_TABLE} columns) =="
+        psql "$DSN" -v ON_ERROR_STOP=1 -At -c \
+          "SELECT column_name FROM information_schema.columns WHERE table_schema='${READY_SCHEMA}' AND table_name='${READY_TABLE}' ORDER BY column_name;" \
+          || echo "(table ${READY_SCHEMA}.${READY_TABLE} not present yet — fresh db)"
+
+        echo "== applying migrations (ON_ERROR_STOP=1; idempotent) =="
+        if [ "$MODE" = "file" ]; then
+          psql "$DSN" -v ON_ERROR_STOP=1 -f "$WORK/$TAR_ENTRY"
+        else
+          # shellcheck disable=SC2012  # migration files are controlled/alphanumeric; lexical `ls|sort` is the intended deterministic order
+          for f in $(ls "$WORK"/*.sql | sort); do
+            echo "-- applying $(basename "$f")"
+            psql "$DSN" -v ON_ERROR_STOP=1 -f "$f"
+          done
+        fi
+
+        # READINESS CHECK (fail-fast): the expected column/table MUST now exist.
+        if [ -n "${READY_COLUMN}" ]; then
+          echo "== readiness: ${READY_SCHEMA}.${READY_TABLE}.${READY_COLUMN} must exist =="
+          CNT="$(psql "$DSN" -v ON_ERROR_STOP=1 -At -c \
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema='${READY_SCHEMA}' AND table_name='${READY_TABLE}' AND column_name='${READY_COLUMN}';")"
+          if [ "$CNT" != "1" ]; then
+            echo "::error::READINESS FAILED — column ${READY_SCHEMA}.${READY_TABLE}.${READY_COLUMN} absent after migrate (got count=${CNT}). Aborting deploy (fail-closed)."
+            exit 1
+          fi
+          echo "readiness OK: column ${READY_COLUMN} present."
+        else
+          echo "== readiness: table ${READY_SCHEMA}.${READY_TABLE} must exist =="
+          CNT="$(psql "$DSN" -v ON_ERROR_STOP=1 -At -c \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='${READY_SCHEMA}' AND table_name='${READY_TABLE}';")"
+          if [ "$CNT" != "1" ]; then
+            echo "::error::READINESS FAILED — table ${READY_SCHEMA}.${READY_TABLE} absent after migrate (got count=${CNT}). Aborting deploy (fail-closed)."
+            exit 1
+          fi
+          echo "readiness OK: table ${READY_TABLE} present."
+        fi
+        echo "Pre-start migrate complete; schema at head."
+        REMOTE
+
+        B64="$(printf '%s' "$REMOTE_SCRIPT" | base64 | tr -d '\n')"
+
+        # Pass MODE/TAR_ENTRY/DB_*/READY_* + password to the remote via env on the ssh
+        # command line. The password is a GitHub-masked secret, so it is redacted in the
+        # log; it never reaches psql argv (PGPASSWORD) and `set -x` is off.
+        tar -C "$TAR_DIR" -czf - "$TAR_ENTRY" \
+          | ssh "$SSH_ALIAS" \
+              MODE="$MODE" TAR_ENTRY="$TAR_ENTRY" \
+              DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" DB_NAME="$DB_NAME" DB_USER="$DB_USER" DB_PASS="$DB_PASS" \
+              READY_TABLE="$READY_TABLE" READY_COLUMN="$READY_COLUMN" READY_SCHEMA="$READY_SCHEMA" \
+              "bash -c \"\$(echo $B64 | base64 -d)\""

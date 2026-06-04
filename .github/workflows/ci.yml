@@ -1,0 +1,53 @@
+name: CI (lint reusable actions/workflows)
+
+# Self-validation for shared-github-actions: actionlint + shellcheck must be
+# green on every PR. This is the guard that keeps the canonical, version-pinned
+# automations correct before any consumer floats on a tag/SHA.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: raven-actions/actionlint@3a24062651993d40fed1019b58ac6fbdfbf276cc # v2.0.1
+        with:
+          fail-on-error: true
+
+  shellcheck:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck composite-action embedded scripts
+        run: |
+          set -euo pipefail
+          # actionlint does not deep-lint `run:` blocks inside composite action.yml,
+          # so extract them and shellcheck explicitly. SC2154 (vars from env/ssh) and
+          # SC2029 (intended client-side base64 expansion) are expected for this pattern.
+          python3 - <<'PY'
+          import glob, yaml, textwrap, subprocess, sys, os
+          rc = 0
+          for f in glob.glob('actions/**/action.yml', recursive=True):
+              a = yaml.safe_load(open(f))
+              for i, step in enumerate(a.get('runs', {}).get('steps', [])):
+                  run = step.get('run')
+                  if not run or step.get('shell') not in ('bash', None):
+                      continue
+                  script = "#!/usr/bin/env bash\n" + run
+                  p = subprocess.run(
+                      ['shellcheck', '-e', 'SC2154,SC2029', '-'],
+                      input=script, text=True, capture_output=True)
+                  if p.returncode != 0:
+                      print(f"::error file={f}::shellcheck failed on step {i}")
+                      print(p.stdout)
+                      rc = 1
+          sys.exit(rc)
+          PY
