@@ -1,0 +1,81 @@
+name: .NET Service CI (Shared)
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: 'Name of the service being built'
+        required: true
+        type: string
+      csproj_path:
+        description: 'Path to the main .csproj file'
+        required: true
+        type: string
+      test_csproj_path:
+        description: 'Path to test .csproj (empty to skip tests)'
+        required: false
+        type: string
+        default: ''
+      dotnet_version:
+        description: '.NET SDK version to use'
+        required: false
+        type: string
+        default: '8.0.x'
+      run_gitleaks:
+        description: 'Whether to run gitleaks secret scan'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  gitleaks:
+    name: Secret Scan (gitleaks)
+    if: ${{ inputs.run_gitleaks }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ inputs.dotnet_version }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Restore
+        run: dotnet restore ${{ inputs.csproj_path }}
+
+      - name: Build
+        run: dotnet build ${{ inputs.csproj_path }} -c Release --no-restore
+
+      - name: Test
+        if: ${{ inputs.test_csproj_path != '' }}
+        run: |
+          dotnet restore ${{ inputs.test_csproj_path }}
+          dotnet test ${{ inputs.test_csproj_path }} -c Release --no-restore --verbosity normal --logger "trx;LogFileName=tests.trx"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ inputs.service_name }}
+          path: tests/**/TestResults/*.trx
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ${{ inputs.service_name }}:ci-${{ github.sha }} .
