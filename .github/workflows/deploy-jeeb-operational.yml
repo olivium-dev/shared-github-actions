@@ -1,0 +1,179 @@
+name: Deploy operational Jeeb ephemeral
+
+on:
+  workflow_call:
+    inputs:
+      shared_actions_sha:
+        description: Exact full commit SHA of this reusable workflow.
+        type: string
+        required: true
+      expected_job_workflow_ref:
+        description: Exact reusable workflow identity approved by the manager.
+        type: string
+        required: true
+      environment:
+        type: string
+        default: jeeb-ephemeral
+      config_path:
+        type: string
+        default: deployments/jeeb-operational.json
+      ttl_minutes:
+        type: number
+        default: 30
+      zone:
+        type: string
+        default: fds-8.space
+    secrets:
+      stage_template_b64:
+        required: true
+      ghcr_token:
+        required: true
+    outputs:
+      lease_id:
+        value: ${{ jobs.deploy.outputs.lease_id }}
+      https_url:
+        value: ${{ jobs.deploy.outputs.https_url }}
+      ssh_hostname:
+        value: ${{ jobs.deploy.outputs.ssh_hostname }}
+      vmid:
+        value: ${{ jobs.deploy.outputs.vmid }}
+      private_ip:
+        value: ${{ jobs.deploy.outputs.private_ip }}
+      expires_at:
+        value: ${{ jobs.deploy.outputs.expires_at }}
+      deployment_lock_sha256:
+        value: ${{ jobs.deploy.outputs.deployment_lock_sha256 }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Provision and deploy all 24 Jeeb services
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      lease_id: ${{ steps.deploy.outputs.lease_id }}
+      https_url: ${{ steps.deploy.outputs.https_url }}
+      ssh_hostname: ${{ steps.deploy.outputs.ssh_hostname }}
+      vmid: ${{ steps.deploy.outputs.vmid }}
+      private_ip: ${{ steps.deploy.outputs.private_ip }}
+      expires_at: ${{ steps.deploy.outputs.expires_at }}
+      deployment_lock_sha256: ${{ steps.deploy.outputs.deployment_lock_sha256 }}
+    steps:
+      - name: Load trusted deployment tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: olivium-dev/shared-github-actions
+          ref: ${{ inputs.shared_actions_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Verify trusted commit
+        env:
+          EXPECTED_SHA: ${{ inputs.shared_actions_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C trusted rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Load reviewed Jeeb configuration
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: caller
+          persist-credentials: false
+
+      - name: Build the static container health probe
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools file
+          make -C caller/runtime/tools \
+            OUT="$RUNNER_TEMP/olivium-runtime-tools" \
+            "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe"
+          file "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe" \
+            | grep -Eq 'ELF.*statically linked'
+
+      - name: Deploy, validate, and activate
+        id: deploy
+        env:
+          JEEB_EPHEMERAL_STAGE_TEMPLATE_B64: ${{ secrets.stage_template_b64 }}
+          JEEB_EPHEMERAL_GHCR_TOKEN: ${{ secrets.ghcr_token }}
+          MANAGER_URL: https://ephemeral.fds-8.space
+          MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
+          EXPECTED_JOB_WORKFLOW_SHA: ${{ inputs.shared_actions_sha }}
+          PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          TTL_MINUTES: ${{ inputs.ttl_minutes }}
+          ZONE: ${{ inputs.zone }}
+        run: |
+          set -euo pipefail
+          case "$CONFIG_PATH" in
+            deployments/*.json) ;;
+            *) echo "::error::config_path must stay under deployments/"; exit 2 ;;
+          esac
+          python3 trusted/scripts/operational_orchestrate.py \
+            --config "caller/$CONFIG_PATH" \
+            --catalog caller/catalog/jeeb-full-v1.json \
+            --postgres-schema caller/bootstrap/postgres-schema.sql.gz \
+            --health-probe "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe" \
+            --guest-script trusted/scripts/operational_guest.py \
+            --state lease-state.json \
+            --ttl-minutes "$TTL_MINUTES" \
+            --zone "$ZONE" \
+            --manager-url "$MANAGER_URL" \
+            --manager-audience "$MANAGER_AUDIENCE" \
+            --expected-job-workflow-ref "$EXPECTED_JOB_WORKFLOW_REF" \
+            --expected-job-workflow-sha "$EXPECTED_JOB_WORKFLOW_SHA" \
+            --environment "$PROTECTED_ENVIRONMENT" \
+            --cloudflared-version 2026.8.2 \
+            --cloudflared-sha256 fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2 \
+            --github-output
+
+      - name: Publish real deployment links
+        if: ${{ success() }}
+        env:
+          HTTPS_URL: ${{ steps.deploy.outputs.https_url }}
+          SSH_HOSTNAME: ${{ steps.deploy.outputs.ssh_hostname }}
+          LEASE_ID: ${{ steps.deploy.outputs.lease_id }}
+          VMID: ${{ steps.deploy.outputs.vmid }}
+          PRIVATE_IP: ${{ steps.deploy.outputs.private_ip }}
+          EXPIRES_AT: ${{ steps.deploy.outputs.expires_at }}
+        run: |
+          {
+            echo '## Jeeb ephemeral deployment'
+            echo
+            echo '| Item | Value |'
+            echo '|---|---|'
+            echo "| Status | **24 Jeeb services validated** |"
+            echo "| HTTPS | [$HTTPS_URL]($HTTPS_URL) |"
+            echo "| Health | [$HTTPS_URL/health/ready]($HTTPS_URL/health/ready) |"
+            echo "| Lease identity | [$HTTPS_URL/.well-known/olivium-lease]($HTTPS_URL/.well-known/olivium-lease) |"
+            echo "| SSH hostname | \`$SSH_HOSTNAME\` |"
+            echo "| SSH command | \`ssh -o ProxyCommand='cloudflared access ssh --hostname %h' ec2-user@$SSH_HOSTNAME\` |"
+            echo "| Lease | \`$LEASE_ID\` |"
+            echo "| VMID | \`$VMID\` |"
+            echo "| Private IP | \`$PRIVATE_IP\` |"
+            echo "| Expires | \`$EXPIRES_AT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Abort a failed pre-active lease
+        if: ${{ always() && hashFiles('trusted/scripts/manager_client.py') != '' }}
+        env:
+          MANAGER_URL: https://ephemeral.fds-8.space
+          MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
+          EXPECTED_JOB_WORKFLOW_SHA: ${{ inputs.shared_actions_sha }}
+          PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 trusted/scripts/manager_client.py abort-if-needed \
+            --manager-url "$MANAGER_URL" \
+            --audience "$MANAGER_AUDIENCE" \
+            --expected-job-workflow-ref "$EXPECTED_JOB_WORKFLOW_REF" \
+            --expected-job-workflow-sha "$EXPECTED_JOB_WORKFLOW_SHA" \
+            --environment "$PROTECTED_ENVIRONMENT" \
+            --state lease-state.json
