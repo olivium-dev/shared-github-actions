@@ -1,0 +1,647 @@
+name: Deploy Jeeb to an ephemeral lease
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        description: Only capability is enabled until the canonical v3 deployment path is certified.
+        type: string
+        default: capability
+      shared_actions_sha:
+        description: Full commit SHA used both to call this workflow and to load its trusted tools.
+        type: string
+        required: true
+      expected_job_workflow_ref:
+        description: Exact manager-approved reusable workflow identity from the GitHub OIDC claim.
+        type: string
+        required: true
+      environment:
+        description: Protected GitHub environment approved by the manager OIDC policy.
+        type: string
+        required: true
+      zone:
+        description: Approved Cloudflare zone for the capability proof.
+        type: string
+        default: fds-8.space
+      config_path:
+        description: Reviewed deployment config path in the caller repository.
+        type: string
+        default: jeeb-ephemeral.json
+      build_intent_path:
+        description: Reviewed immutable pre-build intent path in the caller repository.
+        type: string
+        default: jeeb-build-intent.json
+      expected_service_count:
+        type: number
+        default: 24
+      registry_prefix:
+        description: GHCR prefix linked to the caller repository and covered by package grants.
+        type: string
+        default: ghcr.io/olivium-dev/jeeb-ephemeral-deploy
+      package_grant_set_sha256:
+        description: Owner-reviewed broker evidence hash for all source and GHCR grants.
+        type: string
+        default: ""
+      cloudflared_version:
+        description: Exact cloudflared release, such as 2026.8.0.
+        type: string
+        default: ""
+      cloudflared_sha256:
+        description: SHA-256 of cloudflared-linux-amd64 for the exact release.
+        type: string
+        default: ""
+      health_probe_url:
+        description: Immutable HTTPS URL of the reviewed static amd64 HTTP probe.
+        type: string
+        default: ""
+      health_probe_sha256:
+        description: Reviewed SHA-256 of the static HTTP probe.
+        type: string
+        default: ""
+      health_probe_size:
+        description: Exact probe byte size, at most 500000.
+        type: number
+        default: 0
+      enable_deployment:
+        description: Must be explicitly true for deploy mode.
+        type: boolean
+        default: false
+      github_app_grants_ready:
+        type: boolean
+        default: false
+      package_grants_ready:
+        type: boolean
+        default: false
+      manager_oidc_ready:
+        type: boolean
+        default: false
+      cloudflare_access_ready:
+        type: boolean
+        default: false
+    secrets:
+      runtime_secrets_json:
+        description: Exact ephemeral-only secret map declared by runtime.secrets; never used in capability mode.
+        required: false
+    outputs:
+      capability_ok:
+        value: ${{ jobs.manager_capability.outputs.capability_ok }}
+      lease_id:
+        value: ${{ jobs.lease_orchestrator.outputs.lease_id }}
+      https_url:
+        value: ${{ jobs.lease_orchestrator.outputs.https_url }}
+      ssh_hostname:
+        value: ${{ jobs.lease_orchestrator.outputs.ssh_hostname }}
+      deployment_lock_sha256:
+        value: ${{ jobs.finalize_deployment_lock.outputs.deployment_lock_sha256 }}
+
+permissions: {}
+
+jobs:
+  contract_gate:
+    name: Validate owner-reviewed contracts
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.deploy-contract.outputs.matrix }}
+      deployment_id: ${{ steps.deploy-contract.outputs.deployment_id }}
+      build_intent_sha256: ${{ steps.deploy-contract.outputs.build_intent_sha256 }}
+      zone: ${{ steps.deploy-contract.outputs.zone }}
+      ttl_minutes: ${{ steps.deploy-contract.outputs.ttl_minutes }}
+    steps:
+      - name: Load trusted workflow tools at the exact approved commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: olivium-dev/shared-github-actions
+          ref: ${{ inputs.shared_actions_sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Verify the trusted checkout and capability contract
+        env:
+          SHARED_ACTIONS_SHA: ${{ inputs.shared_actions_sha }}
+          MANAGER_URL: https://ephemeral.fds-8.space
+          MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          APPROVED_ZONE: ${{ inputs.zone }}
+          PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          test "$OPERATION" = capability
+          test "$(git -C trusted rev-parse HEAD)" = "$SHARED_ACTIONS_SHA"
+          python3 trusted/scripts/contracts.py validate-capability \
+            --shared-actions-sha "$SHARED_ACTIONS_SHA" \
+            --manager-url "$MANAGER_URL" \
+            --manager-audience "$MANAGER_AUDIENCE" \
+            --zone "$APPROVED_ZONE" \
+            --environment "$PROTECTED_ENVIRONMENT" \
+            --expected-job-workflow-ref "$EXPECTED_JOB_WORKFLOW_REF" \
+            --output capability-contract
+      - name: Load caller contracts
+        if: ${{ inputs.operation == 'deploy' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: caller
+          persist-credentials: false
+      - name: Validate deployment config and immutable build intent
+        id: deploy-contract
+        if: ${{ inputs.operation == 'deploy' }}
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          BUILD_INTENT_PATH: ${{ inputs.build_intent_path }}
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+          SHARED_ACTIONS_SHA: ${{ inputs.shared_actions_sha }}
+          REGISTRY_PREFIX: ${{ inputs.registry_prefix }}
+          PACKAGE_GRANT_SET_SHA256: ${{ inputs.package_grant_set_sha256 }}
+          CLOUDFLARED_VERSION: ${{ inputs.cloudflared_version }}
+          CLOUDFLARED_SHA256: ${{ inputs.cloudflared_sha256 }}
+          HEALTH_PROBE_URL: ${{ inputs.health_probe_url }}
+          HEALTH_PROBE_SHA256: ${{ inputs.health_probe_sha256 }}
+          HEALTH_PROBE_SIZE: ${{ inputs.health_probe_size }}
+          ENABLE_DEPLOYMENT: ${{ inputs.enable_deployment }}
+          GITHUB_APP_GRANTS_READY: ${{ inputs.github_app_grants_ready }}
+          PACKAGE_GRANTS_READY: ${{ inputs.package_grants_ready }}
+          MANAGER_OIDC_READY: ${{ inputs.manager_oidc_ready }}
+          CLOUDFLARE_ACCESS_READY: ${{ inputs.cloudflare_access_ready }}
+          JEEB_RUNTIME_SECRETS_JSON: ${{ secrets.runtime_secrets_json }}
+        run: |
+          set -euo pipefail
+          python3 trusted/scripts/contracts.py validate-workflow \
+            --config "caller/$CONFIG_PATH" \
+            --intent "caller/$BUILD_INTENT_PATH" \
+            --output validated-contracts \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --shared-actions-sha "$SHARED_ACTIONS_SHA" \
+            --registry-prefix "$REGISTRY_PREFIX" \
+            --package-grant-set-sha256 "$PACKAGE_GRANT_SET_SHA256" \
+            --cloudflared-version "$CLOUDFLARED_VERSION" \
+            --cloudflared-sha256 "$CLOUDFLARED_SHA256" \
+            --health-probe-url "$HEALTH_PROBE_URL" \
+            --health-probe-sha256 "$HEALTH_PROBE_SHA256" \
+            --health-probe-size "$HEALTH_PROBE_SIZE" \
+            --enable-deployment "$ENABLE_DEPLOYMENT" \
+            --github-app-grants-ready "$GITHUB_APP_GRANTS_READY" \
+            --package-grants-ready "$PACKAGE_GRANTS_READY" \
+            --manager-oidc-ready "$MANAGER_OIDC_READY" \
+            --cloudflare-access-ready "$CLOUDFLARE_ACCESS_READY" \
+            --github-output
+      - name: Publish trusted tools
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trusted/scripts
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish capability contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: capability-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capability-contract
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish validated deployment contracts
+        if: ${{ inputs.operation == 'deploy' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validated-contracts
+          if-no-files-found: error
+          retention-days: 1
+
+  manager_capability:
+    name: Prove manager, Cloudflare, and Proxmox capabilities
+    needs: contract_gate
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: none
+    outputs:
+      capability_ok: ${{ steps.capability.outputs.capability_ok }}
+    steps:
+      - name: Load trusted tools
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - name: Load capability contract
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: capability-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capability-contract
+      - name: Mint one OIDC token and call only manager capabilities
+        id: capability
+        env:
+          MANAGER_URL: https://ephemeral.fds-8.space
+          MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          APPROVED_ZONE: ${{ inputs.zone }}
+          EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
+          EXPECTED_JOB_WORKFLOW_SHA: ${{ inputs.shared_actions_sha }}
+          PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 tools/manager_client.py capabilities \
+            --manager-url "$MANAGER_URL" \
+            --audience "$MANAGER_AUDIENCE" \
+            --expected-job-workflow-ref "$EXPECTED_JOB_WORKFLOW_REF" \
+            --expected-job-workflow-sha "$EXPECTED_JOB_WORKFLOW_SHA" \
+            --environment "$PROTECTED_ENVIRONMENT" \
+            --contract capability-contract/capability-contract.json \
+            --zone "$APPROVED_ZONE" \
+            --output capability-result \
+            --github-output
+
+  source_preflight:
+    name: Prove GitHub App and package grants
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, manager_capability]
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: none
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - name: Verify exact repositories and GHCR grant evidence
+        env:
+          SOURCE_BROKER_URL: https://ephemeral.fds-8.space
+          SOURCE_BROKER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          PACKAGE_GRANT_SET_SHA256: ${{ inputs.package_grant_set_sha256 }}
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+        run: |
+          set -euo pipefail
+          python3 tools/source_broker.py preflight \
+            --contracts contracts \
+            --base-url "$SOURCE_BROKER_URL" \
+            --audience "$SOURCE_BROKER_AUDIENCE" \
+            --package-grant-set-sha256 "$PACKAGE_GRANT_SET_SHA256" \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output source-preflight
+
+  health_probe:
+    name: Verify pinned static health probe
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, manager_capability]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - name: Fetch by immutable URL and verify static amd64 ELF
+        env:
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+        run: |
+          set -euo pipefail
+          python3 tools/health_probe.py fetch \
+            --contracts contracts \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output health-probe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: health-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: health-probe
+          if-no-files-found: error
+          retention-days: 1
+
+  resolve_source:
+    name: Resolve source ${{ matrix.id }}
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, source_preflight]
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.contract_gate.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: none
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - name: Ask the GitHub App broker for one exact commit archive
+        env:
+          SERVICE_ID: ${{ matrix.id }}
+          SOURCE_BROKER_URL: https://ephemeral.fds-8.space
+          SOURCE_BROKER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+        run: |
+          set -euo pipefail
+          python3 tools/source_broker.py fetch \
+            --service-id "$SERVICE_ID" \
+            --contracts contracts \
+            --base-url "$SOURCE_BROKER_URL" \
+            --audience "$SOURCE_BROKER_AUDIENCE" \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output resolved-source
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: resolved-source
+          if-no-files-found: error
+          retention-days: 1
+
+  test_build:
+    name: Credential-free test and build ${{ matrix.id }}
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, resolve_source]
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.contract_gate.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: source-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: source
+      - name: Run reviewed test argv and emit an OCI artifact
+        env:
+          SERVICE_ID: ${{ matrix.id }}
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+        run: |
+          set -euo pipefail
+          python3 tools/build_image.py \
+            --service-id "$SERVICE_ID" \
+            --contracts contracts \
+            --source source \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output image-artifact
+      - name: Publish only OCI image and provenance metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            image-artifact/image.oci.tar
+            image-artifact/artifact.json
+            image-artifact/provenance.json
+          if-no-files-found: error
+          retention-days: 1
+
+  push_image:
+    name: Source-free GHCR push ${{ matrix.id }}
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, test_build]
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.contract_gate.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: none
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: image-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: image-artifact
+      - name: Upload observed manifest without source checkout
+        env:
+          SERVICE_ID: ${{ matrix.id }}
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+          REGISTRY_PREFIX: ${{ inputs.registry_prefix }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/registry_push.py \
+            --service-id "$SERVICE_ID" \
+            --contracts contracts \
+            --artifact image-artifact \
+            --registry-prefix "$REGISTRY_PREFIX" \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output registry-receipt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: receipt-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: registry-receipt
+          if-no-files-found: error
+          retention-days: 1
+
+  finalize_deployment_lock:
+    name: Freeze final deployment lock
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, push_image]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    outputs:
+      deployment_lock_sha256: ${{ steps.freeze.outputs.deployment_lock_sha256 }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: receipt-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: receipts
+      - name: Aggregate receipts and freeze the only deployable lock
+        id: freeze
+        env:
+          SHARED_ACTIONS_SHA: ${{ inputs.shared_actions_sha }}
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+        run: |
+          set -euo pipefail
+          python3 tools/contracts.py finalize-lock \
+            --contracts contracts \
+            --receipts receipts \
+            --shared-actions-sha "$SHARED_ACTIONS_SHA" \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output final-lock \
+            --github-output
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final-deployment-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: final-lock
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble_runtime:
+    name: Assemble source-free runtime bundle
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, finalize_deployment_lock, health_probe]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: final-deployment-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: final-lock
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: health-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: health-probe
+      - name: Build bundle from config, final lock, runtime, and probe only
+        env:
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+        run: |
+          set -euo pipefail
+          python3 tools/contracts.py assemble \
+            --contracts contracts \
+            --final-lock final-lock \
+            --health-probe health-probe \
+            --remote-runtime tools/remote_runtime.py \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --output runtime-bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runtime-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-bundle
+          if-no-files-found: error
+          retention-days: 1
+
+  lease_orchestrator:
+    name: Deferred lease, deploy, validate, and activate
+    if: ${{ inputs.operation == 'deploy' }}
+    needs: [contract_gate, manager_capability, assemble_runtime, finalize_deployment_lock]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      packages: read
+      contents: none
+    outputs:
+      lease_id: ${{ steps.orchestrate.outputs.lease_id }}
+      https_url: ${{ steps.orchestrate.outputs.https_url }}
+      ssh_hostname: ${{ steps.orchestrate.outputs.ssh_hostname }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validated-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contracts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: final-deployment-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: final-lock
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: runtime-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-bundle
+      - name: Orchestrate with one ephemeral SSH key and heartbeat
+        id: orchestrate
+        env:
+          MANAGER_URL: https://ephemeral.fds-8.space
+          MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
+          EXPECTED_JOB_WORKFLOW_SHA: ${{ inputs.shared_actions_sha }}
+          PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
+          CLOUDFLARED_VERSION: ${{ inputs.cloudflared_version }}
+          CLOUDFLARED_SHA256: ${{ inputs.cloudflared_sha256 }}
+          EXPECTED_SERVICE_COUNT: ${{ inputs.expected_service_count }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          JEEB_RUNTIME_SECRETS_JSON: ${{ secrets.runtime_secrets_json }}
+        run: |
+          set -euo pipefail
+          python3 tools/orchestrate.py \
+            --contracts contracts \
+            --final-lock final-lock \
+            --bundle runtime-bundle \
+            --state lease-state.json \
+            --manager-url "$MANAGER_URL" \
+            --manager-audience "$MANAGER_AUDIENCE" \
+            --expected-job-workflow-ref "$EXPECTED_JOB_WORKFLOW_REF" \
+            --expected-job-workflow-sha "$EXPECTED_JOB_WORKFLOW_SHA" \
+            --environment "$PROTECTED_ENVIRONMENT" \
+            --cloudflared-version "$CLOUDFLARED_VERSION" \
+            --cloudflared-sha256 "$CLOUDFLARED_SHA256" \
+            --expected-service-count "$EXPECTED_SERVICE_COUNT" \
+            --github-output
+      - name: Preserve non-secret state for independent abort
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lease-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: lease-state.json
+          if-no-files-found: warn
+          retention-days: 1
+
+  abort_preactive_lease:
+    name: State-aware always abort
+    if: ${{ always() && inputs.operation == 'deploy' && needs.contract_gate.result == 'success' }}
+    needs: [contract_gate, lease_orchestrator]
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: none
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-tools-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tools
+      - name: Load lease state when allocation occurred
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: lease-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: state
+      - name: Abort only a manager-confirmed pre-active lease
+        env:
+          MANAGER_URL: https://ephemeral.fds-8.space
+          MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
+          EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
+          EXPECTED_JOB_WORKFLOW_SHA: ${{ inputs.shared_actions_sha }}
+          PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 tools/manager_client.py abort-if-needed \
+            --state state/lease-state.json \
+            --manager-url "$MANAGER_URL" \
+            --audience "$MANAGER_AUDIENCE" \
+            --expected-job-workflow-ref "$EXPECTED_JOB_WORKFLOW_REF" \
+            --expected-job-workflow-sha "$EXPECTED_JOB_WORKFLOW_SHA" \
+            --environment "$PROTECTED_ENVIRONMENT"
