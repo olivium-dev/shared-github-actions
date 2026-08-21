@@ -3,6 +3,10 @@ name: Jeeb ephemeral capability probe
 on:
   workflow_call:
     inputs:
+      operation:
+        required: true
+        type: string
+      
       shared_actions_sha:
         required: true
         type: string
@@ -38,6 +42,7 @@ jobs:
           PROTECTED_ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
+          test "${{ inputs.operation }}" = capability
           test "$(git -C trusted rev-parse HEAD)" = "$SHARED_ACTIONS_SHA"
           python3 trusted/scripts/contracts.py validate-capability \
             --shared-actions-sha "$SHARED_ACTIONS_SHA" \
