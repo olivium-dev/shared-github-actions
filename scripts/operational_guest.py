@@ -7,6 +7,7 @@ import argparse
 import base64
 import gzip
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -236,6 +237,7 @@ def transformed_environment(
     postgres_password: str,
     mongo_password: str,
     public_hostname: str,
+    private_ip: str,
     gateway_routes: list[dict[str, Any]],
 ) -> dict[str, str]:
     service_id = service["id"]
@@ -310,7 +312,7 @@ def transformed_environment(
 
     if service_id == "jeeb-state-service":
         environment["CaseManagement__GatewayCallbackUrl"] = (
-            "http://jeeb-gateway:8080/internal/case-management/callback"
+            f"http://{private_ip}:10000/internal/case-management/callback"
         )
 
     if service_id == "form-builder-service":
@@ -630,6 +632,7 @@ def create_application(
     postgres_password: str,
     mongo_password: str,
     public_hostname: str,
+    private_ip: str,
     probe_config: str,
 ) -> None:
     service_id = service["id"]
@@ -641,6 +644,7 @@ def create_application(
         postgres_password=postgres_password,
         mongo_password=mongo_password,
         public_hostname=public_hostname,
+        private_ip=private_ip,
         gateway_routes=catalog["gatewayRouting"],
     )
     secret_mounts, config_mounts = materialize_mounts(
@@ -742,6 +746,12 @@ def deploy(args: argparse.Namespace) -> None:
     require(hashlib.sha256(canonical(lock_payload)).hexdigest() == lock_hash == args.lock_sha256, "deployment lock mismatch")
     require(SAFE_ID_RE.fullmatch(args.lease_id) is not None, "invalid lease ID")
     public_hostname = f"eph-{args.lease_id}.{args.zone}"
+    try:
+        private_ip = ipaddress.ip_address(args.private_ip)
+    except ValueError as exc:
+        raise DeployError("guest private IP is invalid") from exc
+    rfc1918 = tuple(ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    require(private_ip.version == 4 and any(private_ip in network for network in rfc1918), "guest private IP is not RFC1918")
     prefix = f"jeeb-eph-{args.lease_id}"
     network = prefix
 
@@ -804,6 +814,7 @@ def deploy(args: argparse.Namespace) -> None:
             postgres_password=postgres_password,
             mongo_password=mongo_password,
             public_hostname=public_hostname,
+            private_ip=str(private_ip),
             probe_config=probe_config,
         )
 
@@ -841,6 +852,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--postgres-schema", type=Path, required=True)
     parser.add_argument("--health-probe", type=Path, required=True)
     parser.add_argument("--lease-id", required=True)
+    parser.add_argument("--private-ip", required=True)
     parser.add_argument("--deployment-id", required=True)
     parser.add_argument("--lock-sha256", required=True)
     parser.add_argument("--zone", choices=("fds-8.space", "fds-7.space"), required=True)

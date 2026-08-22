@@ -323,6 +323,7 @@ def upload_runtime(
         f"--postgres-schema {shlex.quote(remote_root + '/postgres-schema.sql.gz')} "
         f"--health-probe {shlex.quote(remote_root + '/http-health-probe')} "
         f"--lease-id {shlex.quote(lease['leaseId'])} "
+        f"--private-ip {shlex.quote(lease['privateIp'])} "
         f"--deployment-id {shlex.quote(lease['deploymentId'])} "
         f"--lock-sha256 {shlex.quote(lease['deploymentLockHash'])} "
         f"--zone {shlex.quote(lease['zone'])}"
