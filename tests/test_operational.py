@@ -273,6 +273,22 @@ class OperationalContractTests(unittest.TestCase):
             self.assertIn(str(version), sql)
         self.assertIn("ON CONFLICT (version) DO NOTHING", sql)
 
+    def test_nginx_routes_public_traffic_to_the_jeeb_gateway(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            config_path = Path(temporary_name) / "default"
+            with mock.patch.object(operational_guest, "run") as run:
+                operational_guest.configure_public_gateway(config_path)
+
+            config = config_path.read_text(encoding="ascii")
+
+        self.assertIn("proxy_pass http://127.0.0.1:10000;", config)
+        self.assertIn("location = /.well-known/olivium-lease", config)
+        self.assertIn("proxy_set_header Upgrade $http_upgrade;", config)
+        self.assertEqual(
+            [mock.call(["nginx", "-t"]), mock.call(["systemctl", "reload", "nginx"])],
+            run.call_args_list,
+        )
+
     def test_application_service_creation_is_explicitly_detached(self) -> None:
         service = {
             "id": "delivery-service",
