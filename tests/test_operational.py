@@ -257,6 +257,22 @@ class OperationalContractTests(unittest.TestCase):
             result["DATABASE_URL"],
         )
 
+    def test_offer_migration_ledger_matches_the_pinned_service_schema(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        with (
+            mock.patch.object(operational_guest, "wait_service", return_value="postgres-container"),
+            mock.patch.object(operational_guest, "docker", return_value=completed) as docker,
+        ):
+            operational_guest.record_offer_migration_ledger("jeeb-eph-test")
+
+        self.assertEqual(10, len(operational_guest.OFFER_SCHEMA_MIGRATIONS))
+        call = docker.call_args
+        self.assertIn("offer_service_staging", call.args[-1])
+        sql = call.kwargs["stdin"].decode()
+        for version in operational_guest.OFFER_SCHEMA_MIGRATIONS:
+            self.assertIn(str(version), sql)
+        self.assertIn("ON CONFLICT (version) DO NOTHING", sql)
+
     def test_application_service_creation_is_explicitly_detached(self) -> None:
         service = {
             "id": "delivery-service",

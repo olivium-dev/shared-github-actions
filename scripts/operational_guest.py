@@ -50,6 +50,18 @@ POSTGRES_DATABASES = {
     "settlement-service": "jeeb_settlement_staging",
     "bundler-service": "jeeb_bundler_staging",
 }
+OFFER_SCHEMA_MIGRATIONS = (
+    20260516000001,
+    20260516000002,
+    20260516000003,
+    20260518082842,
+    20260519140000,
+    20260519140100,
+    20260519160000,
+    20260520090000,
+    20260609000001,
+    20260609000002,
+)
 URL_BY_PORT = {
     "10000": "http://jeeb-gateway:8080",
     "10001": "http://user-management:8080",
@@ -570,6 +582,30 @@ def restore_postgres(schema_path: Path, prefix: str) -> None:
         raise DeployError(f"PostgreSQL schema restore failed: {result.stderr.decode(errors='replace')[-2000:]}")
 
 
+def record_offer_migration_ledger(prefix: str) -> None:
+    cid = wait_service(f"{prefix}-postgresql", healthy=False)
+    values = ",\n".join(f"({version}, CURRENT_TIMESTAMP)" for version in OFFER_SCHEMA_MIGRATIONS)
+    payload = (
+        "INSERT INTO public.schema_migrations (version, inserted_at) VALUES\n"
+        f"{values}\nON CONFLICT (version) DO NOTHING;\n"
+    ).encode()
+    result = docker(
+        "exec",
+        "-i",
+        cid,
+        "sh",
+        "-ceu",
+        'export PGPASSWORD="$POSTGRES_PASSWORD"; '
+        'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d offer_service_staging',
+        stdin=payload,
+        capture=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DeployError(f"Offer migration ledger restore failed: {result.stderr.decode(errors='replace')[-2000:]}")
+
+
 def create_config(name: str, content: bytes, lease_id: str, lock_hash: str, deployment_id: str) -> None:
     if docker("config", "inspect", name, capture=True, check=False).returncode == 0:
         return
@@ -804,6 +840,7 @@ def deploy(args: argparse.Namespace) -> None:
         mongo_password=mongo_password,
     )
     restore_postgres(args.postgres_schema, prefix)
+    record_offer_migration_ledger(prefix)
     probe_config = f"{prefix}-http-health-probe"
     create_config(
         probe_config,
