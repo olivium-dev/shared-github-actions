@@ -179,6 +179,8 @@ jobs:
             echo "| VMID | \`$VMID\` |"
             echo "| Private IP | \`$PRIVATE_IP\` |"
             echo "| Expires | \`$EXPIRES_AT\` |"
+            echo "| Delete now | [Delete this ephemeral environment](https://ephemeral.fds-8.space/?action=delete&lease=$LEASE_ID) |"
+            echo "| Extend lifetime | [Add more usable time](https://ephemeral.fds-8.space/?action=extend&lease=$LEASE_ID) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Abort a failed pre-active lease
