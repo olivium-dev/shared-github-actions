@@ -269,15 +269,38 @@ def upload_runtime(
         lock_path: "deployment-lock.json",
         template_path: "stage-template.b64",
     }
+    remote_files: list[str] = []
     for source, name in files.items():
+        payload = source.read_bytes()
+        remote_path = f"{remote_root}/{name}"
         transport(
-            ["scp", *options, str(source), f"{destination}:{remote_root}/{name}"],
+            [
+                "ssh",
+                *options,
+                destination,
+                f"umask 077; dd of={shlex.quote(remote_path)} status=none",
+            ],
+            stdin=payload,
             timeout=900,
         )
+        remote_digest = transport(
+            [
+                "ssh",
+                *options,
+                destination,
+                f"sha256sum -- {shlex.quote(remote_path)}",
+            ]
+        ).split()[0]
+        require(
+            remote_digest == hashlib.sha256(payload).hexdigest(),
+            f"remote runtime upload digest mismatch: {name}",
+        )
+        remote_files.append(remote_path)
+    quoted_files = " ".join(shlex.quote(path) for path in remote_files)
     install_command = (
-        f"sudo chown -R root:root {shlex.quote(remote_root)} && "
+        f"sudo chown root:root {shlex.quote(remote_root)} {quoted_files} && "
         f"sudo chmod 0700 {shlex.quote(remote_root)} && "
-        f"sudo chmod 0600 {shlex.quote(remote_root)}/* && "
+        f"sudo chmod 0600 {quoted_files} && "
         f"sudo chmod 0500 {shlex.quote(remote_root + '/operational_guest.py')} "
         f"{shlex.quote(remote_root + '/http-health-probe')}"
     )
