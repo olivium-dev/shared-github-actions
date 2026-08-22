@@ -43,6 +43,10 @@ on:
         value: ${{ jobs.deploy.outputs.expires_at }}
       deployment_lock_sha256:
         value: ${{ jobs.deploy.outputs.deployment_lock_sha256 }}
+      seed_user_count:
+        value: ${{ jobs.deploy.outputs.seed_user_count }}
+      seed_wallet_count:
+        value: ${{ jobs.deploy.outputs.seed_wallet_count }}
 
 permissions: {}
 
@@ -63,6 +67,8 @@ jobs:
       private_ip: ${{ steps.deploy.outputs.private_ip }}
       expires_at: ${{ steps.deploy.outputs.expires_at }}
       deployment_lock_sha256: ${{ steps.deploy.outputs.deployment_lock_sha256 }}
+      seed_user_count: ${{ steps.deploy.outputs.seed_user_count }}
+      seed_wallet_count: ${{ steps.deploy.outputs.seed_wallet_count }}
     steps:
       - name: Load trusted deployment tools
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -122,6 +128,7 @@ jobs:
             --postgres-schema caller/bootstrap/postgres-schema.sql.gz \
             --health-probe "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe" \
             --guest-script trusted/scripts/operational_guest.py \
+            --seed-helper trusted/scripts/operational_seed.py \
             --state lease-state.json \
             --ttl-minutes "$TTL_MINUTES" \
             --zone "$ZONE" \
@@ -143,6 +150,10 @@ jobs:
           VMID: ${{ steps.deploy.outputs.vmid }}
           PRIVATE_IP: ${{ steps.deploy.outputs.private_ip }}
           EXPIRES_AT: ${{ steps.deploy.outputs.expires_at }}
+          SEED_USERS: ${{ steps.deploy.outputs.seed_user_count }}
+          SEED_REGULAR_USERS: ${{ steps.deploy.outputs.seed_regular_user_count }}
+          SEED_JEEBERS: ${{ steps.deploy.outputs.seed_jeeber_count }}
+          SEED_WALLETS: ${{ steps.deploy.outputs.seed_wallet_count }}
         run: |
           {
             echo '## Jeeb ephemeral deployment'
@@ -152,6 +163,9 @@ jobs:
             echo "| Status | **24 Jeeb services validated** |"
             echo "| HTTPS | [$HTTPS_URL]($HTTPS_URL) |"
             echo "| Health | [$HTTPS_URL/health/ready]($HTTPS_URL/health/ready) |"
+            echo "| Seeded users | **$SEED_USERS** ($SEED_REGULAR_USERS regular, $SEED_JEEBERS Jeebers) |"
+            echo "| Seeded wallets | **$SEED_WALLETS** |"
+            echo "| Seed roster | [$HTTPS_URL/api/User/super-login/users]($HTTPS_URL/api/User/super-login/users) |"
             echo "| Lease identity | [$HTTPS_URL/.well-known/olivium-lease]($HTTPS_URL/.well-known/olivium-lease) |"
             echo "| SSH hostname | \`$SSH_HOSTNAME\` |"
             echo "| SSH command | \`ssh -o ProxyCommand='cloudflared access ssh --hostname %h' ec2-user@$SSH_HOSTNAME\` |"

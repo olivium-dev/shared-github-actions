@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import operational_guest  # noqa: E402
 import operational_orchestrate  # noqa: E402
+import operational_seed  # noqa: E402
 import manager_client  # noqa: E402
 
 
@@ -47,9 +48,54 @@ SERVICE_IDS = (
 )
 
 
+def seed_data() -> dict:
+    return {
+        "users": [
+            {
+                "id": "10000000-0000-4000-8000-000000000001",
+                "email": "regular@seed.jeeb.invalid",
+                "username": "Regular User",
+                "type": "regular",
+                "wallets": [
+                    {
+                        "id": "20000000-0000-4000-8000-000000000001",
+                        "currencyId": 1,
+                        "type": "customer",
+                        "balance": "25.50",
+                        "note": "regular seed",
+                    }
+                ],
+            },
+            {
+                "id": "10000000-0000-4000-8000-000000000002",
+                "email": "jeeber@seed.jeeb.invalid",
+                "username": "Seed Jeeber",
+                "type": "jeeber",
+                "wallets": [
+                    {
+                        "id": "20000000-0000-4000-8000-000000000002",
+                        "currencyId": 1,
+                        "type": "jeeb",
+                        "balance": "100.00",
+                        "note": "jeeber seed credit",
+                    },
+                    {
+                        "id": "20000000-0000-4000-8000-000000000003",
+                        "currencyId": 2,
+                        "type": "jeeb",
+                        "balance": "12.75",
+                        "note": "jeeber seed usd",
+                    },
+                ],
+            },
+        ]
+    }
+
+
 def operational_config() -> dict:
     digest = "a" * 64
     return {
+        "seedData": seed_data(),
         "services": [
             {
                 "id": service_id,
@@ -113,6 +159,9 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertEqual(24, len(lock["services"]))
         self.assertEqual(set(SERVICE_IDS), {item["serviceId"] for item in lock["services"]})
+        self.assertEqual(2, lock["seedData"]["users"])
+        self.assertEqual(3, lock["seedData"]["wallets"])
+        self.assertEqual(operational_seed.seed_digest(config["seedData"]), lock["seedData"]["sha256"])
         unsigned = dict(lock)
         unsigned.pop("lockSha256")
         self.assertEqual(
@@ -129,6 +178,7 @@ class OperationalContractTests(unittest.TestCase):
                 "postgres_schema": temporary / "postgres-schema.sql.gz",
                 "health_probe": temporary / "http-health-probe",
                 "guest_script": temporary / "operational_guest.py",
+                "seed_helper": temporary / "operational_seed.py",
                 "lock": temporary / "deployment-lock.json",
                 "template": temporary / "stage-template.b64",
             }
@@ -140,6 +190,7 @@ class OperationalContractTests(unittest.TestCase):
                 postgres_schema=sources["postgres_schema"],
                 health_probe=sources["health_probe"],
                 guest_script=sources["guest_script"],
+                seed_helper=sources["seed_helper"],
             )
             lease = {
                 "leaseId": "solar-piplup-26",
@@ -188,11 +239,94 @@ class OperationalContractTests(unittest.TestCase):
                     sources["template"],
                 )
 
-            self.assertEqual(7, len(uploaded))
+            self.assertEqual(8, len(uploaded))
             self.assertFalse(any(command[0] == "scp" for command in commands))
             install = next(command[-1] for command in commands if command[-1].startswith("sudo chown "))
             self.assertNotIn("*", install)
             self.assertIn("operational_guest.py", install)
+            self.assertIn("operational_seed.py", install)
+
+    def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
+        config = operational_config()
+        catalog = {
+            "metadata": {"profile": "jeeb-full", "version": "1"},
+            "services": [{"id": value} for value in SERVICE_IDS],
+        }
+        first_lock, first_hash = operational_orchestrate.deployment_lock(config, catalog, "jeeb-gh-123-1")
+        config["seedData"]["users"][1]["wallets"][0]["balance"] = "777.25"
+        second_lock, second_hash = operational_orchestrate.deployment_lock(config, catalog, "jeeb-gh-123-1")
+
+        self.assertNotEqual(first_hash, second_hash)
+        self.assertNotEqual(first_lock["seedData"]["sha256"], second_lock["seedData"]["sha256"])
+
+    def test_seed_data_rejects_missing_jeeber_currency_and_float_money(self) -> None:
+        missing_currency = seed_data()
+        missing_currency["users"][1]["wallets"].pop()
+        with self.assertRaisesRegex(operational_seed.SeedContractError, "currencyId 1 and 2"):
+            operational_seed.validate_seed_data(missing_currency)
+
+        float_money = seed_data()
+        float_money["users"][0]["wallets"][0]["balance"] = 25.5
+        with self.assertRaisesRegex(operational_seed.SeedContractError, "decimal string"):
+            operational_seed.validate_seed_data(float_money)
+
+    def test_seed_sql_escapes_editable_text_and_uses_real_databases(self) -> None:
+        seed = seed_data()
+        seed["users"][0]["username"] = "O'Neil Customer"
+        seed["users"][0]["wallets"][0]["note"] = "customer's opening balance"
+
+        user_sql = operational_seed.build_user_seed_sql(seed).decode()
+        wallet_sql = operational_seed.build_wallet_seed_sql(seed).decode()
+
+        self.assertIn("O''Neil Customer", user_sql)
+        self.assertIn("customer''s opening balance", wallet_sql)
+        self.assertIn('public."Users"', user_sql)
+        self.assertIn("public.walletholder", wallet_sql)
+        self.assertIn("public.wallets", wallet_sql)
+
+    def test_guest_applies_and_verifies_seed_counts_and_balance(self) -> None:
+        config = {"seedData": seed_data()}
+        receipts = [{"users": 2}, {"wallets": 3, "balance": "138.25"}]
+        with mock.patch.object(operational_guest, "execute_seed_sql", side_effect=receipts) as execute:
+            counts = operational_guest.apply_seed_data(config, "jeeb-eph-test")
+
+        self.assertEqual({"users": 2, "regularUsers": 1, "jeebers": 1, "wallets": 3}, counts)
+        self.assertEqual("jeeb-user-management_staging", execute.call_args_list[0].args[1])
+        self.assertEqual("jeeb-wallet_staging", execute.call_args_list[1].args[1])
+
+    def test_guest_validates_every_seed_login_and_each_jeeber_wallet(self) -> None:
+        seed = seed_data()
+        roster = {
+            "users": [
+                {
+                    "userId": seed["users"][0]["id"],
+                    "name": "Regular User",
+                    "role": "customer",
+                    "roles": ["customer"],
+                },
+                {
+                    "userId": seed["users"][1]["id"],
+                    "name": "Seed Jeeber",
+                    "role": "driver",
+                    "roles": ["customer", "driver"],
+                },
+            ]
+        }
+        responses = [roster, {"authToken": "one.two.three"}, {"authToken": "four.five.six"}, {"availableBalance": 112.75}]
+        with (
+            mock.patch.object(operational_guest, "gateway_json", side_effect=responses) as gateway,
+            mock.patch.object(
+                operational_guest,
+                "service_environment",
+                return_value={"SuperAdmin__PassCode": "not-printed"},
+            ),
+        ):
+            operational_guest.validate_seed_gateway({"seedData": seed}, "jeeb-eph-test")
+
+        self.assertEqual(4, gateway.call_count)
+        login_payloads = [call.kwargs["payload"] for call in gateway.call_args_list[1:3]]
+        self.assertEqual({user["id"] for user in seed["users"]}, {body["userId"] for body in login_payloads})
+        self.assertEqual("/v1/jeeb/wallet", gateway.call_args_list[-1].args[0])
 
     def test_environment_rewrites_stage_dependencies_to_the_lease(self) -> None:
         service = {
