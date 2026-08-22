@@ -17,9 +17,23 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+from operational_seed import (
+    SeedContractError,
+    build_user_seed_sql,
+    build_wallet_seed_sql,
+    roles_for,
+    seed_counts,
+    seed_digest,
+    validate_seed_data,
+    wallet_total,
+)
 
 
 FORBIDDEN = (
@@ -700,6 +714,143 @@ def record_offer_migration_ledger(prefix: str) -> None:
         raise DeployError(f"Offer migration ledger restore failed: {result.stderr.decode(errors='replace')[-2000:]}")
 
 
+def execute_seed_sql(prefix: str, database: str, payload: bytes, label: str) -> dict[str, Any]:
+    cid = wait_service(f"{prefix}-postgresql", healthy=False)
+    result = docker(
+        "exec",
+        "-i",
+        cid,
+        "sh",
+        "-ceu",
+        'export PGPASSWORD="$POSTGRES_PASSWORD"; '
+        f'exec psql -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d {database}',
+        stdin=payload,
+        capture=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace")[-2000:]
+        raise DeployError(f"{label} seed failed: {detail}")
+    lines = [line for line in result.stdout.decode(errors="strict").splitlines() if line.strip()]
+    require(lines, f"{label} seed returned no verification receipt")
+    try:
+        receipt = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise DeployError(f"{label} seed returned an invalid verification receipt") from exc
+    require(isinstance(receipt, dict), f"{label} seed verification receipt must be an object")
+    return receipt
+
+
+def apply_seed_data(config: dict[str, Any], prefix: str) -> dict[str, int]:
+    seed_data = config["seedData"]
+    counts = seed_counts(seed_data)
+    user_receipt = execute_seed_sql(
+        prefix,
+        POSTGRES_DATABASES["user-management"],
+        build_user_seed_sql(seed_data),
+        "user-management",
+    )
+    require(user_receipt.get("users") == counts["users"], "user-management seed count mismatch")
+    wallet_receipt = execute_seed_sql(
+        prefix,
+        POSTGRES_DATABASES["wallet-service"],
+        build_wallet_seed_sql(seed_data),
+        "wallet-service",
+    )
+    expected_balance = sum((wallet_total(user) for user in seed_data["users"]), Decimal("0"))
+    require(wallet_receipt.get("wallets") == counts["wallets"], "wallet seed count mismatch")
+    try:
+        actual_balance = Decimal(str(wallet_receipt.get("balance")))
+    except Exception as exc:
+        raise DeployError("wallet seed balance receipt is invalid") from exc
+    require(actual_balance == expected_balance, "wallet seed balance mismatch")
+    return counts
+
+
+def service_environment(service_name: str) -> dict[str, str]:
+    result = docker(
+        "service",
+        "inspect",
+        "--format",
+        "{{json .Spec.TaskTemplate.ContainerSpec.Env}}",
+        service_name,
+        capture=True,
+    )
+    values = json.loads(result.stdout)
+    require(isinstance(values, list), f"service environment is invalid: {service_name}")
+    environment: dict[str, str] = {}
+    for value in values:
+        key, separator, content = str(value).partition("=")
+        if separator:
+            environment[key] = content
+    return environment
+
+
+def gateway_json(path: str, *, payload: dict[str, Any] | None = None, token: str | None = None) -> Any:
+    headers = {"Accept": "application/json", "User-Agent": "olivium-jeeb-seed-validator/1"}
+    data = None
+    method = "GET"
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode()
+        headers["Content-Type"] = "application/json"
+        method = "POST"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"http://127.0.0.1:10000{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            require(200 <= response.status < 300, f"gateway seed validation failed for {path}")
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        exc.read()
+        raise DeployError(f"gateway seed validation failed for {path} (status {exc.code})") from exc
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise DeployError(f"gateway seed validation failed for {path}") from exc
+
+
+def validate_seed_gateway(config: dict[str, Any], prefix: str) -> None:
+    seed_data = config["seedData"]
+    roster = gateway_json("/api/User/super-login/users")
+    rows = roster.get("users") if isinstance(roster, dict) else None
+    require(isinstance(rows, list), "gateway seed roster is invalid")
+    by_id = {str(row.get("userId")): row for row in rows if isinstance(row, dict)}
+    for user in seed_data["users"]:
+        row = by_id.get(user["id"])
+        require(row is not None, f"gateway roster is missing seeded user {user['id']}")
+        roles, active_role, _ = roles_for(user["type"])
+        require(row.get("name") == user["username"], f"gateway roster name mismatch for {user['id']}")
+        require(row.get("role") == active_role, f"gateway roster role mismatch for {user['id']}")
+        require(row.get("roles") == roles, f"gateway roster roles mismatch for {user['id']}")
+
+    environment = service_environment(f"{prefix}-user-management")
+    passcode = environment.get("SuperAdmin__PassCode", "")
+    require(passcode, "user-management super-login passcode is unavailable")
+    login_tokens: dict[str, str] = {}
+    for user in seed_data["users"]:
+        login = gateway_json(
+            "/api/User/user-id-login",
+            payload={"userId": user["id"], "superAdminPassCode": passcode},
+        )
+        require(isinstance(login, dict), f"seed login response is invalid for {user['id']}")
+        token = login.get("authToken") or login.get("AuthToken")
+        require(isinstance(token, str) and token.count(".") == 2, f"seed login returned no token for {user['id']}")
+        login_tokens[user["id"]] = token
+
+    for jeeber in (user for user in seed_data["users"] if user["type"] == "jeeber"):
+        wallet = gateway_json("/v1/jeeb/wallet", token=login_tokens[jeeber["id"]])
+        require(isinstance(wallet, dict) and "availableBalance" in wallet, "Jeeber wallet response is invalid")
+        require(
+            Decimal(str(wallet["availableBalance"])) == wallet_total(jeeber),
+            f"Jeeber public wallet balance does not match seed data for {jeeber['id']}",
+        )
+
+
 def configure_public_gateway(config_path: Path = Path("/etc/nginx/sites-available/default")) -> None:
     config_path.write_text(
         """server {
@@ -917,6 +1068,10 @@ def validate_config(config: dict[str, Any], catalog: dict[str, Any]) -> None:
         require(SAFE_ID_RE.fullmatch(item["id"]) is not None, "invalid service ID")
         require(IMAGE_RE.fullmatch(item["image"]) is not None, f"image is not digest-pinned: {item['id']}")
         require(item["repository"] == f"olivium-dev/{item['id']}", f"repository mismatch: {item['id']}")
+    try:
+        validate_seed_data(config.get("seedData"))
+    except SeedContractError as exc:
+        raise DeployError(str(exc)) from exc
 
 
 def deploy(args: argparse.Namespace) -> None:
@@ -930,6 +1085,11 @@ def deploy(args: argparse.Namespace) -> None:
     lock_payload = dict(lock)
     lock_hash = lock_payload.pop("lockSha256", "")
     require(hashlib.sha256(canonical(lock_payload)).hexdigest() == lock_hash == args.lock_sha256, "deployment lock mismatch")
+    require(
+        lock.get("seedData")
+        == {"sha256": seed_digest(config["seedData"]), **seed_counts(config["seedData"])},
+        "deployment lock seed data mismatch",
+    )
     require(SAFE_ID_RE.fullmatch(args.lease_id) is not None, "invalid lease ID")
     public_hostname = f"eph-{args.lease_id}.{args.zone}"
     try:
@@ -1019,6 +1179,8 @@ def deploy(args: argparse.Namespace) -> None:
             docker("service", "ps", "--no-trunc", f"{prefix}-{service_id}", check=False)
         raise DeployError("services did not become healthy: " + ", ".join(failures))
 
+    counts = apply_seed_data(config, prefix)
+    validate_seed_gateway(config, prefix)
     docker("logout", "ghcr.io", check=False)
     gateway = f"{prefix}-jeeb-gateway"
     gateway_service = next(item for item in ordered if item["id"] == "jeeb-gateway")
@@ -1033,7 +1195,12 @@ def deploy(args: argparse.Namespace) -> None:
     )
     require(probe.returncode == 0, "gateway loopback health failed")
     configure_public_gateway()
-    print(json.dumps({"ok": True, "serviceCount": 24, "leaseId": args.lease_id}, sort_keys=True))
+    print(
+        json.dumps(
+            {"ok": True, "serviceCount": 24, "leaseId": args.lease_id, "seedData": counts},
+            sort_keys=True,
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

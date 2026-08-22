@@ -23,6 +23,7 @@ from typing import Any
 
 from common import ContractError, canonical_sha256, require, write_github_output, write_json
 from manager_client import ManagerClient
+from operational_seed import SeedContractError, seed_counts, seed_digest, validate_seed_data
 
 
 IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
@@ -104,6 +105,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str,
         require(IMAGE_RE.fullmatch(str(item.get("image", ""))) is not None, f"{item.get('id')} image is not digest-pinned")
         require(FULL_SHA.fullmatch(str(item.get("commit", ""))) is not None, f"{item.get('id')} commit is not immutable")
         require(item.get("ref") in {"main", "master"} or isinstance(item.get("ref"), str), f"{item.get('id')} branch is invalid")
+    try:
+        validate_seed_data(config.get("seedData"))
+    except SeedContractError as exc:
+        raise ContractError(str(exc)) from exc
     ttl = args.ttl_minutes if args.ttl_minutes is not None else config["defaults"]["ttlMinutes"]
     zone = args.zone or config["defaults"]["zone"]
     require(isinstance(ttl, int) and 5 <= ttl <= 240, "TTL must be 5..240 minutes")
@@ -125,6 +130,10 @@ def deployment_lock(config: dict[str, Any], catalog: dict[str, Any], deployment_
         "validation": {
             "vmProfile": "jeeb-swarm-v1",
             "serviceCount": 24,
+        },
+        "seedData": {
+            "sha256": seed_digest(config["seedData"]),
+            **seed_counts(config["seedData"]),
         },
         "services": [
             {
@@ -266,6 +275,7 @@ def upload_runtime(
         args.postgres_schema: "postgres-schema.sql.gz",
         args.health_probe: "http-health-probe",
         args.guest_script: "operational_guest.py",
+        args.seed_helper: "operational_seed.py",
         lock_path: "deployment-lock.json",
         template_path: "stage-template.b64",
     }
@@ -346,6 +356,37 @@ def wait_public(url: str, timeout: int = 300) -> None:
             last = str(exc)
             time.sleep(5)
     raise ContractError(f"public endpoint did not become ready: {last}")
+
+
+def wait_public_seed_roster(base_url: str, seed_data: dict[str, Any], timeout: int = 300) -> None:
+    deadline = time.monotonic() + timeout
+    expected = {user["id"]: user["username"] for user in seed_data["users"]}
+    request = urllib.request.Request(
+        f"{base_url}/api/User/super-login/users",
+        headers={"Accept": "application/json", "User-Agent": "olivium-jeeb-operational/1"},
+    )
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(request, timeout=20, context=ssl.create_default_context()) as response:
+                require(200 <= response.status < 300, "public seed roster returned non-success")
+                payload = json.loads(response.read())
+                rows = payload.get("users") if isinstance(payload, dict) else None
+                require(isinstance(rows, list), "public seed roster is invalid")
+                actual = {
+                    str(row.get("userId")): row.get("name")
+                    for row in rows
+                    if isinstance(row, dict)
+                }
+                require(
+                    all(actual.get(user_id) == username for user_id, username in expected.items()),
+                    "public seed roster is missing configured users",
+                )
+                return
+        except (urllib.error.URLError, json.JSONDecodeError, ContractError) as exc:
+            last = str(exc)
+            time.sleep(5)
+    raise ContractError(f"public seed roster did not become ready: {last}")
 
 
 def save_state(path: Path, lease: dict[str, Any] | None, lock_hash: str) -> None:
@@ -454,7 +495,9 @@ def run_deployment(args: argparse.Namespace) -> None:
                 ]
             )
             require(lease_id in identity, "Cloudflare SSH reached the wrong lease")
-            wait_public(f"https://{lease['httpsHostname']}/health/ready")
+            public_url = f"https://{lease['httpsHostname']}"
+            wait_public(f"{public_url}/health/ready")
+            wait_public_seed_roster(public_url, config["seedData"])
             heartbeat.stop()
             heartbeat = None
             lease = client.lease(lease_id)
@@ -465,7 +508,9 @@ def run_deployment(args: argparse.Namespace) -> None:
             lease = client.lease(lease_id)
             require(lease.get("state") == "active", "manager did not activate the validated lease")
             save_state(args.state, lease, lock_hash)
-            wait_public(f"https://{lease['httpsHostname']}/health/ready")
+            wait_public(f"{public_url}/health/ready")
+            wait_public_seed_roster(public_url, config["seedData"])
+            counts = seed_counts(config["seedData"])
             if args.github_output:
                 write_github_output(
                     {
@@ -476,6 +521,10 @@ def run_deployment(args: argparse.Namespace) -> None:
                         "private_ip": lease["privateIp"],
                         "expires_at": lease["expiresAt"],
                         "deployment_lock_sha256": lock_hash,
+                        "seed_user_count": str(counts["users"]),
+                        "seed_regular_user_count": str(counts["regularUsers"]),
+                        "seed_jeeber_count": str(counts["jeebers"]),
+                        "seed_wallet_count": str(counts["wallets"]),
                     }
                 )
             print(
@@ -486,6 +535,7 @@ def run_deployment(args: argparse.Namespace) -> None:
                         "httpsUrl": f"https://{lease['httpsHostname']}",
                         "sshHostname": lease["sshHostname"],
                         "serviceCount": 24,
+                        "seedData": counts,
                     },
                     sort_keys=True,
                 )
@@ -525,6 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--postgres-schema", type=Path, required=True)
     parser.add_argument("--health-probe", type=Path, required=True)
     parser.add_argument("--guest-script", type=Path, required=True)
+    parser.add_argument("--seed-helper", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--ttl-minutes", type=int)
     parser.add_argument("--zone")
