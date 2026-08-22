@@ -129,6 +129,18 @@ def operational_config() -> dict:
 
 
 class OperationalContractTests(unittest.TestCase):
+    def test_workflow_summary_contains_real_lifecycle_links(self) -> None:
+        workflow = (ROOT / ".github/workflows/deploy-jeeb-operational.yml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "https://ephemeral.fds-8.space/?action=delete&lease=$LEASE_ID",
+            workflow,
+        )
+        self.assertIn(
+            "https://ephemeral.fds-8.space/?action=extend&lease=$LEASE_ID",
+            workflow,
+        )
+
     def test_manager_get_retries_a_transient_read_timeout(self) -> None:
         client = manager_client.ManagerClient(
             base_url="http://127.0.0.1:1",
