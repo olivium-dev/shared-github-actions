@@ -85,15 +85,29 @@ class ManagerClient:
 
     def request(self, method: str, path: str, body: Any | None = None, expected: tuple[int, ...] = (200,)) -> Any:
         require(path.startswith("/api/automation/v1/"), "manager API path is outside the automation boundary")
-        payload, _ = request_json(
-            method,
-            f"{self.base_url}{path}",
-            bearer=self.fresh_token(),
-            body=body,
-            expected=expected,
-        )
-        require(isinstance(payload, dict), "manager response must be an object")
-        return payload
+        attempts = 4 if method == "GET" else 1
+        for attempt in range(attempts):
+            try:
+                payload, _ = request_json(
+                    method,
+                    f"{self.base_url}{path}",
+                    bearer=self.fresh_token(),
+                    body=body,
+                    expected=expected,
+                )
+                require(isinstance(payload, dict), "manager response must be an object")
+                return payload
+            except (TimeoutError, OSError) as exc:
+                if attempt + 1 == attempts:
+                    raise ContractError(f"manager read failed after transient retries: {exc}") from exc
+            except ContractError as exc:
+                retryable = str(exc).startswith(
+                    ("trusted endpoint request failed:", "GitHub OIDC token request failed:")
+                )
+                if not retryable or attempt + 1 == attempts:
+                    raise
+            time.sleep(attempt + 1)
+        raise ContractError("manager read retry loop ended unexpectedly")
 
     def capabilities(self, zone: str) -> dict[str, Any]:
         response = self.request("GET", f"/api/automation/v1/capabilities?{urllib.parse.urlencode({'zone': zone})}")

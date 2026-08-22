@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import operational_guest  # noqa: E402
 import operational_orchestrate  # noqa: E402
+import manager_client  # noqa: E402
 
 
 SERVICE_IDS = (
@@ -59,6 +61,44 @@ def operational_config() -> dict:
 
 
 class OperationalContractTests(unittest.TestCase):
+    def test_manager_get_retries_a_transient_read_timeout(self) -> None:
+        client = manager_client.ManagerClient(
+            base_url="http://127.0.0.1:1",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        with (
+            mock.patch.object(client, "fresh_token", return_value="token"),
+            mock.patch.object(
+                manager_client,
+                "request_json",
+                side_effect=[TimeoutError("read timed out"), ({"ok": True}, {})],
+            ) as request,
+            mock.patch.object(manager_client.time, "sleep"),
+        ):
+            self.assertEqual({"ok": True}, client.request("GET", "/api/automation/v1/jobs/1"))
+        self.assertEqual(2, request.call_count)
+
+    def test_manager_post_does_not_retry_an_ambiguous_timeout(self) -> None:
+        client = manager_client.ManagerClient(
+            base_url="http://127.0.0.1:1",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        with (
+            mock.patch.object(client, "fresh_token", return_value="token"),
+            mock.patch.object(manager_client, "request_json", side_effect=TimeoutError("read timed out")) as request,
+        ):
+            with self.assertRaises(manager_client.ContractError):
+                client.request("POST", "/api/automation/v1/leases/one/progress", {})
+        self.assertEqual(1, request.call_count)
+
     def test_deployment_lock_is_canonical_and_covers_exact_service_set(self) -> None:
         config = operational_config()
         catalog = {
