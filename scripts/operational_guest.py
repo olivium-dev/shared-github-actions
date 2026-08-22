@@ -850,6 +850,14 @@ def validate_seed_gateway(config: dict[str, Any], prefix: str) -> None:
             f"Jeeber public wallet balance does not match seed data for {jeeber['id']}",
         )
 
+    for admin in (user for user in seed_data["users"] if user["type"] == "admin"):
+        session = gateway_json("/admin/session", token=login_tokens[admin["id"]])
+        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+        require(
+            isinstance(capabilities, list) and "admin.portal.access" in capabilities,
+            f"admin portal capability is unavailable for {admin['id']}",
+        )
+
 
 def configure_public_gateway(config_path: Path = Path("/etc/nginx/sites-available/default")) -> None:
     config_path.write_text(
@@ -863,7 +871,33 @@ def configure_public_gateway(config_path: Path = Path("/etc/nginx/sites-availabl
         alias /etc/olivium-ephemeral-lease;
     }
 
-    location / {
+    location = /gateway {
+        return 308 /gateway/;
+    }
+
+    location /gateway/ {
+        proxy_pass http://127.0.0.1:10000/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:10080/health;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location ~ ^/(?:api|v1|admin|health)(?:/|$) {
         proxy_pass http://127.0.0.1:10000;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -874,6 +908,15 @@ def configure_public_gateway(config_path: Path = Path("/etc/nginx/sites-availabl
         proxy_set_header Connection "upgrade";
         proxy_read_timeout 300s;
         proxy_buffering off;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:10080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
     }
 }
 """,
@@ -1057,6 +1100,57 @@ def create_application(
         env_path.unlink(missing_ok=True)
 
 
+def create_web_application(
+    application: dict[str, Any],
+    *,
+    prefix: str,
+    network: str,
+    lease_id: str,
+    lock_hash: str,
+    deployment_id: str,
+    probe_config: str,
+) -> None:
+    application_id = application["id"]
+    image = application["image"]
+    digest = image.rsplit("@", 1)[1]
+    command = [
+        "service",
+        "create",
+        "--detach=true",
+        "--name",
+        f"{prefix}-{application_id}",
+        *labels(lease_id, lock_hash, deployment_id, application_id),
+        "--label",
+        f"com.olivium.ephemeral.image-digest={digest}",
+        "--network",
+        f"name={network},alias={application_id}",
+        "--config",
+        f"source={probe_config},target=/run/olivium/http-health-probe,mode=0555",
+        "--restart-condition",
+        "any",
+        "--limit-cpu",
+        "1",
+        "--limit-memory",
+        "1G",
+        "--log-driver",
+        "json-file",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
+        "--publish",
+        f"published={application['hostPort']},target={application['internalPort']},mode=host",
+        "--with-registry-auth",
+        image,
+    ]
+    docker(*command, timeout=1800)
+    configure_application_healthcheck(
+        f"{prefix}-{application_id}",
+        int(application["internalPort"]),
+        application["healthPath"],
+    )
+
+
 def validate_config(config: dict[str, Any], catalog: dict[str, Any]) -> None:
     require(config.get("apiVersion") == "olivium.dev/jeeb-operational-ephemeral/v1", "unsupported config")
     services = config.get("services")
@@ -1068,6 +1162,16 @@ def validate_config(config: dict[str, Any], catalog: dict[str, Any]) -> None:
         require(SAFE_ID_RE.fullmatch(item["id"]) is not None, "invalid service ID")
         require(IMAGE_RE.fullmatch(item["image"]) is not None, f"image is not digest-pinned: {item['id']}")
         require(item["repository"] == f"olivium-dev/{item['id']}", f"repository mismatch: {item['id']}")
+    web_applications = config.get("webApplications")
+    require(isinstance(web_applications, list) and len(web_applications) == 1, "config must contain one web application")
+    web_application = web_applications[0]
+    require(isinstance(web_application, dict), "web application must be an object")
+    require(web_application.get("id") == "jeeb-cms", "web application must be jeeb-cms")
+    require(web_application.get("repository") == "olivium-dev/jeeb-cms", "jeeb-cms repository is invalid")
+    require(IMAGE_RE.fullmatch(str(web_application.get("image", ""))) is not None, "jeeb-cms image is not digest-pinned")
+    require(web_application.get("internalPort") == 8080, "jeeb-cms internal port must be 8080")
+    require(web_application.get("hostPort") == 10080, "jeeb-cms host port must be 10080")
+    require(web_application.get("healthPath") == "/health", "jeeb-cms health path must be /health")
     try:
         validate_seed_data(config.get("seedData"))
     except SeedContractError as exc:
@@ -1090,6 +1194,23 @@ def deploy(args: argparse.Namespace) -> None:
         == {"sha256": seed_digest(config["seedData"]), **seed_counts(config["seedData"])},
         "deployment lock seed data mismatch",
     )
+    expected_web_applications = [
+        {
+            "applicationId": item["id"],
+            "repository": item["repository"],
+            "commit": item["commit"],
+            "ref": item["ref"],
+            "internalPort": item["internalPort"],
+            "hostPort": item["hostPort"],
+            "healthPath": item["healthPath"],
+            "image": {
+                "reference": item["image"],
+                "digest": item["image"].rsplit("@", 1)[1],
+            },
+        }
+        for item in sorted(config["webApplications"], key=lambda row: row["id"])
+    ]
+    require(lock.get("webApplications") == expected_web_applications, "deployment lock web applications mismatch")
     require(SAFE_ID_RE.fullmatch(args.lease_id) is not None, "invalid lease ID")
     public_hostname = f"eph-{args.lease_id}.{args.zone}"
     try:
@@ -1165,6 +1286,18 @@ def deploy(args: argparse.Namespace) -> None:
             probe_config=probe_config,
         )
 
+    web_application = config["webApplications"][0]
+    docker("pull", web_application["image"], timeout=1800)
+    create_web_application(
+        web_application,
+        prefix=prefix,
+        network=network,
+        lease_id=args.lease_id,
+        lock_hash=lock_hash,
+        deployment_id=args.deployment_id,
+        probe_config=probe_config,
+    )
+
     failures: list[str] = []
     for service in ordered:
         name = f"{prefix}-{service['id']}"
@@ -1178,6 +1311,16 @@ def deploy(args: argparse.Namespace) -> None:
         for service_id in failures:
             docker("service", "ps", "--no-trunc", f"{prefix}-{service_id}", check=False)
         raise DeployError("services did not become healthy: " + ", ".join(failures))
+
+    web_application_name = f"{prefix}-{web_application['id']}"
+    wait_application(
+        web_application_name,
+        int(web_application["internalPort"]),
+        web_application["healthPath"],
+        timeout=300,
+    )
+    wait_service(web_application_name, healthy=True, timeout=300)
+    print(f"healthy: {web_application['id']}", flush=True)
 
     counts = apply_seed_data(config, prefix)
     validate_seed_gateway(config, prefix)
@@ -1194,10 +1337,22 @@ def deploy(args: argparse.Namespace) -> None:
         check=False,
     )
     require(probe.returncode == 0, "gateway loopback health failed")
+    cms_probe = run(
+        [str(args.health_probe), "--url", "http://127.0.0.1:10080/health"],
+        capture=True,
+        check=False,
+    )
+    require(cms_probe.returncode == 0, "CMS loopback health failed")
     configure_public_gateway()
     print(
         json.dumps(
-            {"ok": True, "serviceCount": 24, "leaseId": args.lease_id, "seedData": counts},
+            {
+                "ok": True,
+                "serviceCount": 24,
+                "webApplicationCount": 1,
+                "leaseId": args.lease_id,
+                "seedData": counts,
+            },
             sort_keys=True,
         )
     )

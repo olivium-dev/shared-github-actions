@@ -105,6 +105,17 @@ def validate_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str,
         require(IMAGE_RE.fullmatch(str(item.get("image", ""))) is not None, f"{item.get('id')} image is not digest-pinned")
         require(FULL_SHA.fullmatch(str(item.get("commit", ""))) is not None, f"{item.get('id')} commit is not immutable")
         require(item.get("ref") in {"main", "master"} or isinstance(item.get("ref"), str), f"{item.get('id')} branch is invalid")
+    web_applications = config.get("webApplications")
+    require(isinstance(web_applications, list) and len(web_applications) == 1, "config must contain one web application")
+    web_application = web_applications[0]
+    require(isinstance(web_application, dict), "web application must be an object")
+    require(web_application.get("id") == "jeeb-cms", "web application must be jeeb-cms")
+    require(web_application.get("repository") == "olivium-dev/jeeb-cms", "jeeb-cms repository is invalid")
+    require(IMAGE_RE.fullmatch(str(web_application.get("image", ""))) is not None, "jeeb-cms image is not digest-pinned")
+    require(FULL_SHA.fullmatch(str(web_application.get("commit", ""))) is not None, "jeeb-cms commit is not immutable")
+    require(web_application.get("internalPort") == 8080, "jeeb-cms internal port must be 8080")
+    require(web_application.get("hostPort") == 10080, "jeeb-cms host port must be 10080")
+    require(web_application.get("healthPath") == "/health", "jeeb-cms health path must be /health")
     try:
         validate_seed_data(config.get("seedData"))
     except SeedContractError as exc:
@@ -147,6 +158,22 @@ def deployment_lock(config: dict[str, Any], catalog: dict[str, Any], deployment_
                 },
             }
             for item in sorted(config["services"], key=lambda row: row["id"])
+        ],
+        "webApplications": [
+            {
+                "applicationId": item["id"],
+                "repository": item["repository"],
+                "commit": item["commit"],
+                "ref": item["ref"],
+                "internalPort": item["internalPort"],
+                "hostPort": item["hostPort"],
+                "healthPath": item["healthPath"],
+                "image": {
+                    "reference": item["image"],
+                    "digest": item["image"].rsplit("@", 1)[1],
+                },
+            }
+            for item in sorted(config["webApplications"], key=lambda row: row["id"])
         ],
     }
     lock_hash = hashlib.sha256(canonical(value)).hexdigest()
@@ -358,11 +385,17 @@ def wait_public(url: str, timeout: int = 300) -> None:
     raise ContractError(f"public endpoint did not become ready: {last}")
 
 
+def wait_public_cms(base_url: str, timeout: int = 300) -> None:
+    required_paths = ("/health", "/login", "/mf/config/remoteEntry.js")
+    for path in required_paths:
+        wait_public(f"{base_url}{path}", timeout=timeout)
+
+
 def wait_public_seed_roster(base_url: str, seed_data: dict[str, Any], timeout: int = 300) -> None:
     deadline = time.monotonic() + timeout
     expected = {user["id"]: user["username"] for user in seed_data["users"]}
     request = urllib.request.Request(
-        f"{base_url}/api/User/super-login/users",
+        f"{base_url}/gateway/api/User/super-login/users",
         headers={"Accept": "application/json", "User-Agent": "olivium-jeeb-operational/1"},
     )
     last = ""
@@ -497,6 +530,7 @@ def run_deployment(args: argparse.Namespace) -> None:
             require(lease_id in identity, "Cloudflare SSH reached the wrong lease")
             public_url = f"https://{lease['httpsHostname']}"
             wait_public(f"{public_url}/health/ready")
+            wait_public_cms(public_url)
             wait_public_seed_roster(public_url, config["seedData"])
             heartbeat.stop()
             heartbeat = None
@@ -509,6 +543,7 @@ def run_deployment(args: argparse.Namespace) -> None:
             require(lease.get("state") == "active", "manager did not activate the validated lease")
             save_state(args.state, lease, lock_hash)
             wait_public(f"{public_url}/health/ready")
+            wait_public_cms(public_url)
             wait_public_seed_roster(public_url, config["seedData"])
             counts = seed_counts(config["seedData"])
             if args.github_output:
@@ -524,6 +559,7 @@ def run_deployment(args: argparse.Namespace) -> None:
                         "seed_user_count": str(counts["users"]),
                         "seed_regular_user_count": str(counts["regularUsers"]),
                         "seed_jeeber_count": str(counts["jeebers"]),
+                        "seed_admin_count": str(counts["admins"]),
                         "seed_wallet_count": str(counts["wallets"]),
                     }
                 )
@@ -535,6 +571,7 @@ def run_deployment(args: argparse.Namespace) -> None:
                         "httpsUrl": f"https://{lease['httpsHostname']}",
                         "sshHostname": lease["sshHostname"],
                         "serviceCount": 24,
+                        "webApplicationCount": 1,
                         "seedData": counts,
                     },
                     sort_keys=True,
