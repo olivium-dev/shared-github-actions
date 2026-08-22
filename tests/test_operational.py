@@ -295,10 +295,12 @@ class OperationalContractTests(unittest.TestCase):
             "image": f"ghcr.io/olivium-dev/delivery-service@sha256:{'a' * 64}",
             "stagingName": "jeeb-staging-delivery-service",
             "internalPort": 8080,
+            "healthPath": "/health/ready",
         }
         with (
             mock.patch.object(operational_guest, "transformed_environment", return_value={}),
             mock.patch.object(operational_guest, "materialize_mounts", return_value=([], [])),
+            mock.patch.object(operational_guest, "configure_application_healthcheck") as healthcheck,
             mock.patch.object(operational_guest, "docker") as docker,
         ):
             operational_guest.create_application(
@@ -319,6 +321,41 @@ class OperationalContractTests(unittest.TestCase):
             )
 
         self.assertIn("--detach=true", docker.call_args.args)
+        healthcheck.assert_called_once_with("jeeb-eph-test-delivery-service", 8080, "/health/ready")
+
+    def test_application_healthcheck_uses_engine_exec_form(self) -> None:
+        inspected = [
+            {
+                "ID": "service-id",
+                "Version": {"Index": 9},
+                "Spec": {"TaskTemplate": {"ContainerSpec": {"Image": "image@sha256:digest"}}},
+            }
+        ]
+        completed = SimpleNamespace(stdout=json.dumps(inspected).encode())
+        with (
+            mock.patch.object(operational_guest, "docker", return_value=completed),
+            mock.patch.object(operational_guest, "docker_api_post", return_value={}) as api_post,
+        ):
+            operational_guest.configure_application_healthcheck(
+                "jeeb-eph-test-cdn-service",
+                8080,
+                "/health/ready",
+            )
+
+        path, spec = api_post.call_args.args
+        self.assertEqual(
+            "/v1.41/services/service-id/update?version=9&registryAuthFrom=spec",
+            path,
+        )
+        self.assertEqual(
+            [
+                "CMD",
+                "/run/olivium/http-health-probe",
+                "--url",
+                "http://127.0.0.1:8080/health/ready",
+            ],
+            spec["TaskTemplate"]["ContainerSpec"]["Healthcheck"]["Test"],
+        )
 
     def test_application_health_probe_is_exec_form_without_a_shell(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")

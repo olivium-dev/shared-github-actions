@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,99 @@ def run(
 
 def docker(*arguments: str, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
     return run(["docker", *arguments], **kwargs)
+
+
+def decode_chunked_http(body: bytes) -> bytes:
+    decoded = bytearray()
+    offset = 0
+    while True:
+        line_end = body.find(b"\r\n", offset)
+        require(line_end >= 0, "Docker API returned an invalid chunked response")
+        try:
+            size = int(body[offset:line_end].split(b";", 1)[0], 16)
+        except ValueError as exc:
+            raise DeployError("Docker API returned an invalid chunk size") from exc
+        offset = line_end + 2
+        if size == 0:
+            return bytes(decoded)
+        chunk_end = offset + size
+        require(chunk_end + 2 <= len(body), "Docker API returned a truncated chunk")
+        decoded.extend(body[offset:chunk_end])
+        require(body[chunk_end : chunk_end + 2] == b"\r\n", "Docker API chunk is malformed")
+        offset = chunk_end + 2
+
+
+def docker_api_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    encoded = canonical(payload)
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        "Host: docker\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(encoded)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + encoded
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(30)
+        client.connect("/var/run/docker.sock")
+        client.sendall(request)
+        response = bytearray()
+        while True:
+            block = client.recv(65536)
+            if not block:
+                break
+            response.extend(block)
+    headers, separator, body = bytes(response).partition(b"\r\n\r\n")
+    require(bool(separator), "Docker API returned an invalid HTTP response")
+    status_line = headers.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    match = re.fullmatch(r"HTTP/1\.[01] ([0-9]{3})(?: .*)?", status_line)
+    require(match is not None, "Docker API returned an invalid status line")
+    header_lines = {
+        key.strip().lower(): value.strip().lower()
+        for key, separator, value in (line.partition(b":") for line in headers.split(b"\r\n")[1:])
+        if separator
+    }
+    if header_lines.get(b"transfer-encoding") == b"chunked":
+        body = decode_chunked_http(body)
+    status = int(match.group(1))
+    require(200 <= status < 300, f"Docker API update failed with HTTP {status}: {body[-1000:].decode(errors='replace')}")
+    if not body:
+        return {}
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise DeployError("Docker API returned invalid JSON") from exc
+    require(isinstance(result, dict), "Docker API response is not an object")
+    return result
+
+
+def configure_application_healthcheck(name: str, port: int, path: str) -> None:
+    inspected = json.loads(docker("service", "inspect", name, capture=True).stdout)
+    require(isinstance(inspected, list) and len(inspected) == 1, f"cannot inspect service {name}")
+    service = inspected[0]
+    service_id = service.get("ID")
+    version = service.get("Version", {}).get("Index")
+    spec = service.get("Spec")
+    require(isinstance(service_id, str) and service_id, f"service {name} has no ID")
+    require(isinstance(version, int) and version >= 1, f"service {name} has no version")
+    require(isinstance(spec, dict), f"service {name} has no specification")
+    container_spec = spec.get("TaskTemplate", {}).get("ContainerSpec")
+    require(isinstance(container_spec, dict), f"service {name} has no container specification")
+    container_spec["Healthcheck"] = {
+        "Test": [
+            "CMD",
+            "/run/olivium/http-health-probe",
+            "--url",
+            f"http://127.0.0.1:{port}{path}",
+        ],
+        "Interval": 10_000_000_000,
+        "Timeout": 5_000_000_000,
+        "Retries": 60,
+        "StartPeriod": 60_000_000_000,
+    }
+    docker_api_post(
+        f"/v1.41/services/{quote(service_id, safe='')}/update?version={version}&registryAuthFrom=spec",
+        spec,
+    )
 
 
 def load_json(path: Path) -> Any:
@@ -803,6 +897,11 @@ def create_application(
             command.extend(("--publish", f"published=10000,target={service['internalPort']},mode=host"))
         command.extend(("--with-registry-auth", image))
         docker(*command, timeout=1800)
+        configure_application_healthcheck(
+            f"{prefix}-{service_id}",
+            int(service["internalPort"]),
+            service["healthPath"],
+        )
     finally:
         env_path.unlink(missing_ok=True)
 
@@ -911,6 +1010,7 @@ def deploy(args: argparse.Namespace) -> None:
         name = f"{prefix}-{service['id']}"
         try:
             wait_application(name, int(service["internalPort"]), service["healthPath"], timeout=1200)
+            wait_service(name, healthy=True, timeout=300)
             print(f"healthy: {service['id']}", flush=True)
         except DeployError:
             failures.append(service["id"])
