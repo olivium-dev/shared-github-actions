@@ -223,6 +223,84 @@ class OperationalContractTests(unittest.TestCase):
         for forbidden in operational_guest.FORBIDDEN:
             self.assertNotIn(forbidden, serialized)
 
+    def test_materialized_mounts_preserve_non_root_ownership(self) -> None:
+        template = {
+            "secrets": {"state-token": "secret-value"},
+            "configs": {"settings": "config-value"},
+        }
+        service = {
+            "secrets": [
+                {
+                    "name": "state-token",
+                    "target": "jeeb_state_service_token",
+                    "uid": "64198",
+                    "gid": "64198",
+                    "mode": 0o400,
+                }
+            ],
+            "configs": [
+                {
+                    "name": "settings",
+                    "target": "/app/settings.json",
+                    "uid": "1000",
+                    "gid": "1001",
+                    "mode": 0o440,
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(operational_guest, "create_secret"),
+            mock.patch.object(operational_guest, "create_config"),
+        ):
+            secrets, configs = operational_guest.materialize_mounts(
+                template,
+                service,
+                prefix="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="a" * 64,
+                deployment_id="jeeb-gh-1-1",
+                service_id="jeeb-state-service",
+                postgres_password="postgres-password",
+            )
+
+        self.assertEqual("64198", secrets[0]["uid"])
+        self.assertEqual("64198", secrets[0]["gid"])
+        self.assertEqual(0o400, secrets[0]["mode"])
+        self.assertEqual("1000", configs[0]["uid"])
+        self.assertEqual("1001", configs[0]["gid"])
+        self.assertEqual(
+            "source=jeeb-eph-test-jeeb-state-service-secret-00,"
+            "target=jeeb_state_service_token,uid=64198,gid=64198,mode=0400",
+            operational_guest.mount_spec(secrets[0]),
+        )
+
+    def test_materialized_mounts_reject_invalid_ownership(self) -> None:
+        template = {"secrets": {"state-token": "secret-value"}}
+        service = {
+            "secrets": [
+                {
+                    "name": "state-token",
+                    "target": "jeeb_state_service_token",
+                    "uid": "root",
+                    "gid": "64198",
+                    "mode": 0o400,
+                }
+            ]
+        }
+        with mock.patch.object(operational_guest, "create_secret"):
+            with self.assertRaisesRegex(operational_guest.DeployError, "invalid secret UID"):
+                operational_guest.materialize_mounts(
+                    template,
+                    service,
+                    prefix="jeeb-eph-test",
+                    lease_id="bright-pikachu-42",
+                    lock_hash="a" * 64,
+                    deployment_id="jeeb-gh-1-1",
+                    service_id="jeeb-state-service",
+                    postgres_password="postgres-password",
+                )
+
     def test_guest_config_requires_exactly_the_catalog_services(self) -> None:
         config = operational_config()
         config["apiVersion"] = "olivium.dev/jeeb-operational-ephemeral/v1"

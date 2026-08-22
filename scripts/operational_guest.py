@@ -550,6 +550,19 @@ def create_secret(name: str, content: bytes, lease_id: str, lock_hash: str, depl
     docker("secret", "create", *labels(lease_id, lock_hash, deployment_id), name, "-", stdin=content)
 
 
+def mount_owner(value: Any, *, service_id: str, field: str) -> str:
+    owner = str(value if value is not None else "0")
+    require(owner.isdigit() and 0 <= int(owner) <= 2**31 - 1, f"invalid {field} for {service_id}")
+    return owner
+
+
+def mount_spec(mount: dict[str, Any]) -> str:
+    return (
+        f"source={mount['name']},target={mount['target']},uid={mount['uid']},"
+        f"gid={mount['gid']},mode={mount['mode']:04o}"
+    )
+
+
 def materialize_mounts(
     template: dict[str, Any],
     template_service: dict[str, Any],
@@ -572,7 +585,15 @@ def materialize_mounts(
             value = dotnet_connection("settlement-service", postgres_password).encode()
         name = f"{prefix}-{service_id}-secret-{index:02d}"
         create_secret(name, value, lease_id, lock_hash, deployment_id)
-        secret_mounts.append({"name": name, "target": mount["target"], "mode": int(mount["mode"])})
+        secret_mounts.append(
+            {
+                "name": name,
+                "target": mount["target"],
+                "uid": mount_owner(mount.get("uid"), service_id=service_id, field="secret UID"),
+                "gid": mount_owner(mount.get("gid"), service_id=service_id, field="secret GID"),
+                "mode": int(mount["mode"]),
+            }
+        )
 
     config_mounts: list[dict[str, Any]] = []
     for index, mount in enumerate(template_service.get("configs", [])):
@@ -583,7 +604,15 @@ def materialize_mounts(
         value = template["configs"][old_name].encode()
         name = f"{prefix}-{service_id}-config-{index:02d}"
         create_config(name, value, lease_id, lock_hash, deployment_id)
-        config_mounts.append({"name": name, "target": mount["target"], "mode": int(mount["mode"])})
+        config_mounts.append(
+            {
+                "name": name,
+                "target": mount["target"],
+                "uid": mount_owner(mount.get("uid"), service_id=service_id, field="config UID"),
+                "gid": mount_owner(mount.get("gid"), service_id=service_id, field="config GID"),
+                "mode": int(mount["mode"]),
+            }
+        )
     return secret_mounts, config_mounts
 
 
@@ -672,9 +701,9 @@ def create_application(
             "max-file=3",
         ]
         for mount in secret_mounts:
-            command.extend(("--secret", f"source={mount['name']},target={mount['target']},mode={mount['mode']:04o}"))
+            command.extend(("--secret", mount_spec(mount)))
         for mount in config_mounts:
-            command.extend(("--config", f"source={mount['name']},target={mount['target']},mode={mount['mode']:04o}"))
+            command.extend(("--config", mount_spec(mount)))
         if service_id == "cdn-service":
             volume = f"{prefix}-cdn-data"
             ensure_volume(volume, lease_id, lock_hash, deployment_id)
