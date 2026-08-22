@@ -147,6 +147,7 @@ class OperationalContractTests(unittest.TestCase):
                 "deploymentId": "jeeb-gh-1-1",
                 "deploymentLockHash": "a" * 64,
                 "zone": "fds-8.space",
+                "privateIp": "192.168.2.160",
             }
             uploaded: dict[str, bytes] = {}
             commands: list[list[str]] = []
@@ -212,6 +213,7 @@ class OperationalContractTests(unittest.TestCase):
             postgres_password="postgres-password",
             mongo_password="mongo-password",
             public_hostname="eph-bright-pikachu-42.fds-8.space",
+            private_ip="192.168.2.160",
             gateway_routes=[
                 {"configKey": "Services__Users__BaseUrl", "value": "http://user-management:8080"}
             ],
@@ -222,6 +224,22 @@ class OperationalContractTests(unittest.TestCase):
         self.assertIn("eph-bright-pikachu-42.fds-8.space", serialized)
         for forbidden in operational_guest.FORBIDDEN:
             self.assertNotIn(forbidden, serialized)
+
+    def test_state_callback_uses_the_lease_private_ip(self) -> None:
+        result = operational_guest.transformed_environment(
+            {"id": "jeeb-state-service"},
+            {"env": ["CaseManagement__GatewayCallbackUrl=http://192.168.2.20:10000/old"]},
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            public_hostname="eph-bright-pikachu-42.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+
+        self.assertEqual(
+            "http://192.168.2.160:10000/internal/case-management/callback",
+            result["CaseManagement__GatewayCallbackUrl"],
+        )
 
     def test_materialized_mounts_preserve_non_root_ownership(self) -> None:
         template = {
