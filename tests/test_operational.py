@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -116,6 +119,79 @@ class OperationalContractTests(unittest.TestCase):
             lock_hash,
             hashlib.sha256(operational_orchestrate.canonical(unsigned)).hexdigest(),
         )
+
+    def test_runtime_upload_streams_and_verifies_each_file_without_scp_or_globs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            temporary = Path(temporary_name)
+            sources = {
+                "config": temporary / "config.json",
+                "catalog": temporary / "catalog.json",
+                "postgres_schema": temporary / "postgres-schema.sql.gz",
+                "health_probe": temporary / "http-health-probe",
+                "guest_script": temporary / "operational_guest.py",
+                "lock": temporary / "deployment-lock.json",
+                "template": temporary / "stage-template.b64",
+            }
+            for index, path in enumerate(sources.values(), start=1):
+                path.write_bytes(f"payload-{index}".encode())
+            args = SimpleNamespace(
+                config=sources["config"],
+                catalog=sources["catalog"],
+                postgres_schema=sources["postgres_schema"],
+                health_probe=sources["health_probe"],
+                guest_script=sources["guest_script"],
+            )
+            lease = {
+                "leaseId": "solar-piplup-26",
+                "sshHostname": "ssh-eph-solar-piplup-26.fds-8.space",
+                "deploymentId": "jeeb-gh-1-1",
+                "deploymentLockHash": "a" * 64,
+                "zone": "fds-8.space",
+            }
+            uploaded: dict[str, bytes] = {}
+            commands: list[list[str]] = []
+
+            def fake_transport(argv: list[str], *, stdin: bytes | None = None, timeout: int = 1800) -> str:
+                del timeout
+                commands.append(argv)
+                command = argv[-1]
+                if command.startswith("umask 077; dd of="):
+                    path = command.split("dd of=", 1)[1].split(" status=none", 1)[0]
+                    uploaded[path] = stdin or b""
+                elif command.startswith("sha256sum -- "):
+                    path = command.removeprefix("sha256sum -- ")
+                    return hashlib.sha256(uploaded[path]).hexdigest() + "  " + path
+                elif command.startswith("sudo python3 "):
+                    return '{"ok":true}'
+                return ""
+
+            with (
+                mock.patch.object(operational_orchestrate, "transport", side_effect=fake_transport),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "JEEB_EPHEMERAL_GHCR_TOKEN": "token-that-is-long-enough",
+                        "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
+                        "GITHUB_ACTOR": "tester",
+                    },
+                ),
+            ):
+                operational_orchestrate.upload_runtime(
+                    args,
+                    lease,
+                    temporary,
+                    temporary / "id_ed25519",
+                    temporary / "known_hosts",
+                    temporary / "cloudflared",
+                    sources["lock"],
+                    sources["template"],
+                )
+
+            self.assertEqual(7, len(uploaded))
+            self.assertFalse(any(command[0] == "scp" for command in commands))
+            install = next(command[-1] for command in commands if command[-1].startswith("sudo chown "))
+            self.assertNotIn("*", install)
+            self.assertIn("operational_guest.py", install)
 
     def test_environment_rewrites_stage_dependencies_to_the_lease(self) -> None:
         service = {
