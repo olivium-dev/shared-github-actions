@@ -606,6 +606,39 @@ def record_offer_migration_ledger(prefix: str) -> None:
         raise DeployError(f"Offer migration ledger restore failed: {result.stderr.decode(errors='replace')[-2000:]}")
 
 
+def configure_public_gateway(config_path: Path = Path("/etc/nginx/sites-available/default")) -> None:
+    config_path.write_text(
+        """server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location = /.well-known/olivium-lease {
+        default_type text/plain;
+        alias /etc/olivium-ephemeral-lease;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+    }
+}
+""",
+        encoding="ascii",
+    )
+    os.chmod(config_path, 0o644)
+    run(["nginx", "-t"])
+    run(["systemctl", "reload", "nginx"])
+
+
 def create_config(name: str, content: bytes, lease_id: str, lock_hash: str, deployment_id: str) -> None:
     if docker("config", "inspect", name, capture=True, check=False).returncode == 0:
         return
@@ -899,6 +932,7 @@ def deploy(args: argparse.Namespace) -> None:
         check=False,
     )
     require(probe.returncode == 0, "gateway loopback health failed")
+    configure_public_gateway()
     print(json.dumps({"ok": True, "serviceCount": 24, "leaseId": args.lease_id}, sort_keys=True))
 
 
