@@ -90,11 +90,12 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends musl-tools file
-          make -C caller/runtime/tools \
+          make -C caller/runtime/tools CC=musl-gcc \
             OUT="$RUNNER_TEMP/olivium-runtime-tools" \
             "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe"
           file "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe" \
             | grep -Eq 'ELF.*statically linked'
+          test "$(wc -c < "$RUNNER_TEMP/olivium-runtime-tools/http-health-probe")" -le 500000
 
       - name: Deploy, validate, and activate
         id: deploy
