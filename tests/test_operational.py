@@ -241,6 +241,53 @@ class OperationalContractTests(unittest.TestCase):
             result["CaseManagement__GatewayCallbackUrl"],
         )
 
+    def test_generic_postgres_url_disables_ssl_inside_the_lease(self) -> None:
+        result = operational_guest.transformed_environment(
+            {"id": "delivery-service"},
+            {"env": ["DATABASE_URL=postgresql://staging.invalid/delivery"]},
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            public_hostname="eph-bright-pikachu-42.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+
+        self.assertEqual(
+            "postgresql://oudaykhaled:postgres-password@postgresql:5432/delivery_staging?sslmode=disable",
+            result["DATABASE_URL"],
+        )
+
+    def test_application_service_creation_is_explicitly_detached(self) -> None:
+        service = {
+            "id": "delivery-service",
+            "image": f"ghcr.io/olivium-dev/delivery-service@sha256:{'a' * 64}",
+            "stagingName": "jeeb-staging-delivery-service",
+            "internalPort": 8080,
+        }
+        with (
+            mock.patch.object(operational_guest, "transformed_environment", return_value={}),
+            mock.patch.object(operational_guest, "materialize_mounts", return_value=([], [])),
+            mock.patch.object(operational_guest, "docker") as docker,
+        ):
+            operational_guest.create_application(
+                service,
+                {},
+                {},
+                {"gatewayRouting": []},
+                prefix="jeeb-eph-test",
+                network="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="b" * 64,
+                deployment_id="jeeb-gh-1-1",
+                postgres_password="postgres-password",
+                mongo_password="mongo-password",
+                public_hostname="eph-bright-pikachu-42.fds-8.space",
+                private_ip="192.168.2.160",
+                probe_config="jeeb-eph-test-http-health-probe",
+            )
+
+        self.assertIn("--detach=true", docker.call_args.args)
+
     def test_application_health_probe_is_exec_form_without_a_shell(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
         with (

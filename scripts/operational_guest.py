@@ -238,7 +238,7 @@ def database_url(service_id: str, password: str) -> str:
         return f"postgresql+asyncpg://{encoded_user}:{encoded_password}@postgresql:5432/{database}"
     if service_id in {"offer-service", "realtime-comunication-service"}:
         return f"ecto://{encoded_user}:{encoded_password}@postgresql:5432/{database}"
-    return f"postgresql://{encoded_user}:{encoded_password}@postgresql:5432/{database}"
+    return f"postgresql://{encoded_user}:{encoded_password}@postgresql:5432/{database}?sslmode=disable"
 
 
 def dotnet_connection(service_id: str, password: str) -> str:
@@ -420,6 +420,7 @@ def create_infrastructure(
     docker(
         "service",
         "create",
+        "--detach=true",
         "--name",
         f"{prefix}-postgresql",
         *common,
@@ -462,6 +463,7 @@ def create_infrastructure(
     docker(
         "service",
         "create",
+        "--detach=true",
         "--name",
         f"{prefix}-mongodb",
         *common,
@@ -507,6 +509,7 @@ def create_infrastructure(
     docker(
         "service",
         "create",
+        "--detach=true",
         "--name",
         f"{prefix}-redis",
         *common,
@@ -531,6 +534,7 @@ def create_infrastructure(
     docker(
         "service",
         "create",
+        "--detach=true",
         "--name",
         f"{prefix}-lease-local-registry",
         *common,
@@ -693,6 +697,7 @@ def create_application(
         command = [
             "service",
             "create",
+            "--detach=true",
             "--name",
             f"{prefix}-{service_id}",
             *labels(lease_id, lock_hash, deployment_id, service_id),
