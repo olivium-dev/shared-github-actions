@@ -88,6 +88,13 @@ def seed_data() -> dict:
                     },
                 ],
             },
+            {
+                "id": "10000000-0000-4000-8000-000000000003",
+                "email": "cms.operator@seed.jeeb.invalid",
+                "username": "CMS Operator",
+                "type": "admin",
+                "wallets": [],
+            },
         ]
     }
 
@@ -105,7 +112,19 @@ def operational_config() -> dict:
                 "image": f"ghcr.io/olivium-dev/{service_id}@sha256:{digest}",
             }
             for service_id in SERVICE_IDS
-        ]
+        ],
+        "webApplications": [
+            {
+                "id": "jeeb-cms",
+                "repository": "olivium-dev/jeeb-cms",
+                "commit": "c" * 40,
+                "ref": "main",
+                "image": f"ghcr.io/olivium-dev/jeeb-cms@sha256:{'d' * 64}",
+                "internalPort": 8080,
+                "hostPort": 10080,
+                "healthPath": "/health",
+            }
+        ],
     }
 
 
@@ -159,8 +178,11 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertEqual(24, len(lock["services"]))
         self.assertEqual(set(SERVICE_IDS), {item["serviceId"] for item in lock["services"]})
-        self.assertEqual(2, lock["seedData"]["users"])
+        self.assertEqual(3, lock["seedData"]["users"])
+        self.assertEqual(1, lock["seedData"]["admins"])
         self.assertEqual(3, lock["seedData"]["wallets"])
+        self.assertEqual("jeeb-cms", lock["webApplications"][0]["applicationId"])
+        self.assertEqual(10080, lock["webApplications"][0]["hostPort"])
         self.assertEqual(operational_seed.seed_digest(config["seedData"]), lock["seedData"]["sha256"])
         unsigned = dict(lock)
         unsigned.pop("lockSha256")
@@ -286,11 +308,14 @@ class OperationalContractTests(unittest.TestCase):
 
     def test_guest_applies_and_verifies_seed_counts_and_balance(self) -> None:
         config = {"seedData": seed_data()}
-        receipts = [{"users": 2}, {"wallets": 3, "balance": "138.25"}]
+        receipts = [{"users": 3}, {"wallets": 3, "balance": "138.25"}]
         with mock.patch.object(operational_guest, "execute_seed_sql", side_effect=receipts) as execute:
             counts = operational_guest.apply_seed_data(config, "jeeb-eph-test")
 
-        self.assertEqual({"users": 2, "regularUsers": 1, "jeebers": 1, "wallets": 3}, counts)
+        self.assertEqual(
+            {"users": 3, "regularUsers": 1, "jeebers": 1, "admins": 1, "wallets": 3},
+            counts,
+        )
         self.assertEqual("jeeb-user-management_staging", execute.call_args_list[0].args[1])
         self.assertEqual("jeeb-wallet_staging", execute.call_args_list[1].args[1])
 
@@ -310,9 +335,22 @@ class OperationalContractTests(unittest.TestCase):
                     "role": "driver",
                     "roles": ["customer", "driver"],
                 },
+                {
+                    "userId": seed["users"][2]["id"],
+                    "name": "CMS Operator",
+                    "role": "admin",
+                    "roles": ["admin"],
+                },
             ]
         }
-        responses = [roster, {"authToken": "one.two.three"}, {"authToken": "four.five.six"}, {"availableBalance": 112.75}]
+        responses = [
+            roster,
+            {"authToken": "one.two.three"},
+            {"authToken": "four.five.six"},
+            {"authToken": "seven.eight.nine"},
+            {"availableBalance": 112.75},
+            {"capabilities": ["admin.portal.access", "cms.config.read"]},
+        ]
         with (
             mock.patch.object(operational_guest, "gateway_json", side_effect=responses) as gateway,
             mock.patch.object(
@@ -323,10 +361,11 @@ class OperationalContractTests(unittest.TestCase):
         ):
             operational_guest.validate_seed_gateway({"seedData": seed}, "jeeb-eph-test")
 
-        self.assertEqual(4, gateway.call_count)
-        login_payloads = [call.kwargs["payload"] for call in gateway.call_args_list[1:3]]
+        self.assertEqual(6, gateway.call_count)
+        login_payloads = [call.kwargs["payload"] for call in gateway.call_args_list[1:4]]
         self.assertEqual({user["id"] for user in seed["users"]}, {body["userId"] for body in login_payloads})
-        self.assertEqual("/v1/jeeb/wallet", gateway.call_args_list[-1].args[0])
+        self.assertEqual("/v1/jeeb/wallet", gateway.call_args_list[-2].args[0])
+        self.assertEqual("/admin/session", gateway.call_args_list[-1].args[0])
 
     def test_environment_rewrites_stage_dependencies_to_the_lease(self) -> None:
         service = {
@@ -407,7 +446,7 @@ class OperationalContractTests(unittest.TestCase):
             self.assertIn(str(version), sql)
         self.assertIn("ON CONFLICT (version) DO NOTHING", sql)
 
-    def test_nginx_routes_public_traffic_to_the_jeeb_gateway(self) -> None:
+    def test_nginx_routes_cms_and_gateway_traffic_without_exposing_private_ports(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:
             config_path = Path(temporary_name) / "default"
             with mock.patch.object(operational_guest, "run") as run:
@@ -415,7 +454,12 @@ class OperationalContractTests(unittest.TestCase):
 
             config = config_path.read_text(encoding="ascii")
 
-        self.assertIn("proxy_pass http://127.0.0.1:10000;", config)
+        self.assertIn("location /gateway/", config)
+        self.assertIn("proxy_pass http://127.0.0.1:10000/;", config)
+        self.assertIn("location = /health", config)
+        self.assertIn("proxy_pass http://127.0.0.1:10080/health;", config)
+        self.assertIn("location ~ ^/(?:api|v1|admin|health)(?:/|$)", config)
+        self.assertIn("proxy_pass http://127.0.0.1:10080;", config)
         self.assertIn("location = /.well-known/olivium-lease", config)
         self.assertIn("proxy_set_header Upgrade $http_upgrade;", config)
         self.assertEqual(
@@ -456,6 +500,34 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertIn("--detach=true", docker.call_args.args)
         healthcheck.assert_called_once_with("jeeb-eph-test-delivery-service", 8080, "/health/ready")
+
+    def test_cms_service_creation_publishes_only_the_reserved_web_port(self) -> None:
+        application = {
+            "id": "jeeb-cms",
+            "image": f"ghcr.io/olivium-dev/jeeb-cms@sha256:{'a' * 64}",
+            "internalPort": 8080,
+            "hostPort": 10080,
+            "healthPath": "/health",
+        }
+        with (
+            mock.patch.object(operational_guest, "configure_application_healthcheck") as healthcheck,
+            mock.patch.object(operational_guest, "docker") as docker,
+        ):
+            operational_guest.create_web_application(
+                application,
+                prefix="jeeb-eph-test",
+                network="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="b" * 64,
+                deployment_id="jeeb-gh-1-1",
+                probe_config="jeeb-eph-test-http-health-probe",
+            )
+
+        command = docker.call_args.args
+        self.assertIn("--detach=true", command)
+        self.assertIn("published=10080,target=8080,mode=host", command)
+        self.assertNotIn("published=10000,target=8080,mode=host", command)
+        healthcheck.assert_called_once_with("jeeb-eph-test-jeeb-cms", 8080, "/health")
 
     def test_application_healthcheck_uses_engine_exec_form(self) -> None:
         inspected = [

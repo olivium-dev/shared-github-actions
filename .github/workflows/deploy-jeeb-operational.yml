@@ -47,12 +47,14 @@ on:
         value: ${{ jobs.deploy.outputs.seed_user_count }}
       seed_wallet_count:
         value: ${{ jobs.deploy.outputs.seed_wallet_count }}
+      seed_admin_count:
+        value: ${{ jobs.deploy.outputs.seed_admin_count }}
 
 permissions: {}
 
 jobs:
   deploy:
-    name: Provision and deploy all 24 Jeeb services
+    name: Provision 24 Jeeb services and CMS
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     environment: ${{ inputs.environment }}
@@ -69,6 +71,7 @@ jobs:
       deployment_lock_sha256: ${{ steps.deploy.outputs.deployment_lock_sha256 }}
       seed_user_count: ${{ steps.deploy.outputs.seed_user_count }}
       seed_wallet_count: ${{ steps.deploy.outputs.seed_wallet_count }}
+      seed_admin_count: ${{ steps.deploy.outputs.seed_admin_count }}
     steps:
       - name: Load trusted deployment tools
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -153,6 +156,7 @@ jobs:
           SEED_USERS: ${{ steps.deploy.outputs.seed_user_count }}
           SEED_REGULAR_USERS: ${{ steps.deploy.outputs.seed_regular_user_count }}
           SEED_JEEBERS: ${{ steps.deploy.outputs.seed_jeeber_count }}
+          SEED_ADMINS: ${{ steps.deploy.outputs.seed_admin_count }}
           SEED_WALLETS: ${{ steps.deploy.outputs.seed_wallet_count }}
         run: |
           {
@@ -160,12 +164,14 @@ jobs:
             echo
             echo '| Item | Value |'
             echo '|---|---|'
-            echo "| Status | **24 Jeeb services validated** |"
-            echo "| HTTPS | [$HTTPS_URL]($HTTPS_URL) |"
+            echo "| Status | **24 Jeeb services and Jeeb CMS validated** |"
+            echo "| Jeeb CMS | [$HTTPS_URL]($HTTPS_URL) |"
+            echo "| CMS login | [$HTTPS_URL/login]($HTTPS_URL/login) |"
             echo "| Health | [$HTTPS_URL/health/ready]($HTTPS_URL/health/ready) |"
-            echo "| Seeded users | **$SEED_USERS** ($SEED_REGULAR_USERS regular, $SEED_JEEBERS Jeebers) |"
+            echo "| CMS health | [$HTTPS_URL/health]($HTTPS_URL/health) |"
+            echo "| Seeded users | **$SEED_USERS** ($SEED_REGULAR_USERS regular, $SEED_JEEBERS Jeebers, $SEED_ADMINS admins) |"
             echo "| Seeded wallets | **$SEED_WALLETS** |"
-            echo "| Seed roster | [$HTTPS_URL/api/User/super-login/users]($HTTPS_URL/api/User/super-login/users) |"
+            echo "| Seed roster | [$HTTPS_URL/gateway/api/User/super-login/users]($HTTPS_URL/gateway/api/User/super-login/users) |"
             echo "| Lease identity | [$HTTPS_URL/.well-known/olivium-lease]($HTTPS_URL/.well-known/olivium-lease) |"
             echo "| SSH hostname | \`$SSH_HOSTNAME\` |"
             echo "| SSH command | \`ssh -o ProxyCommand='cloudflared access ssh --hostname %h' ec2-user@$SSH_HOSTNAME\` |"

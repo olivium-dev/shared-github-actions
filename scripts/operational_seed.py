@@ -14,7 +14,7 @@ from typing import Any
 SEED_KEYS = {"users"}
 USER_KEYS = {"id", "email", "username", "type", "wallets"}
 WALLET_KEYS = {"id", "currencyId", "type", "balance", "note"}
-USER_TYPES = {"regular", "jeeber"}
+USER_TYPES = {"regular", "jeeber", "admin"}
 SUPPORTED_CURRENCY_IDS = {1, 2}
 EMAIL_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,127}@[a-z0-9][a-z0-9.-]{0,126}$")
 WALLET_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
@@ -100,12 +100,14 @@ def validate_seed_data(seed_data: Any) -> dict[str, Any]:
         _plain_text(user["username"], f"{context}.username", 100)
 
         user_type = user["type"]
-        require(user_type in USER_TYPES, f"{context}.type must be regular or jeeber")
+        require(user_type in USER_TYPES, f"{context}.type must be regular, jeeber, or admin")
         user_types.add(user_type)
         wallets = user["wallets"]
+        minimum_wallets = 0 if user_type == "admin" else 1
+        require(isinstance(wallets, list), f"{context}.wallets must be an array")
         require(
-            isinstance(wallets, list) and 1 <= len(wallets) <= len(SUPPORTED_CURRENCY_IDS),
-            f"{context}.wallets must contain 1..{len(SUPPORTED_CURRENCY_IDS)} wallets",
+            minimum_wallets <= len(wallets) <= len(SUPPORTED_CURRENCY_IDS),
+            f"{context}.wallets must contain {minimum_wallets}..{len(SUPPORTED_CURRENCY_IDS)} wallets",
         )
         currencies: set[int] = set()
         for wallet_index, wallet in enumerate(wallets):
@@ -131,7 +133,10 @@ def validate_seed_data(seed_data: Any) -> dict[str, Any]:
         if user_type == "jeeber":
             require(currencies == SUPPORTED_CURRENCY_IDS, f"{context} jeeber wallets must include currencyId 1 and 2")
 
-    require(user_types == USER_TYPES, "seedData must contain at least one regular user and one jeeber")
+    require(
+        user_types == USER_TYPES,
+        "seedData must contain at least one regular user, one jeeber, and one admin",
+    )
     return seed_data
 
 
@@ -147,6 +152,7 @@ def seed_counts(seed_data: dict[str, Any]) -> dict[str, int]:
         "users": len(users),
         "regularUsers": sum(user["type"] == "regular" for user in users),
         "jeebers": sum(user["type"] == "jeeber" for user in users),
+        "admins": sum(user["type"] == "admin" for user in users),
         "wallets": sum(len(user["wallets"]) for user in users),
     }
 
@@ -154,6 +160,8 @@ def seed_counts(seed_data: dict[str, Any]) -> dict[str, int]:
 def roles_for(user_type: str) -> tuple[list[str], str, str]:
     if user_type == "jeeber":
         return ["customer", "driver"], "driver", "jeeber"
+    if user_type == "admin":
+        return ["admin"], "admin", "admin"
     return ["customer"], "customer", "customer"
 
 
@@ -215,6 +223,8 @@ def build_wallet_seed_sql(seed_data: dict[str, Any]) -> bytes:
     validate_seed_data(seed_data)
     statements = ["BEGIN;", "SET LOCAL lock_timeout = '10s';"]
     for user in seed_data["users"]:
+        if not user["wallets"]:
+            continue
         _, _, holder_type = roles_for(user["type"])
         statements.append(
             """
