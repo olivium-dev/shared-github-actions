@@ -201,6 +201,32 @@ def wait_service(name: str, *, healthy: bool, timeout: int = 900) -> str:
     raise DeployError(f"service {name} did not become {'healthy' if healthy else 'running'} (last={last})")
 
 
+def wait_application(name: str, port: int, path: str, timeout: int = 1200) -> str:
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            container_id = wait_service(name, healthy=False, timeout=30)
+        except DeployError as exc:
+            last = str(exc)
+            time.sleep(5)
+            continue
+        probe = docker(
+            "exec",
+            container_id,
+            "/run/olivium/http-health-probe",
+            "--url",
+            f"http://127.0.0.1:{port}{path}",
+            capture=True,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return container_id
+        last = (probe.stderr or probe.stdout or b"").decode(errors="replace")[-1000:]
+        time.sleep(5)
+    raise DeployError(f"application did not become ready: {name}: {last}")
+
+
 def database_url(service_id: str, password: str) -> str:
     database = POSTGRES_DATABASES[service_id]
     user = "oudaykhaled"
@@ -678,19 +704,6 @@ def create_application(
             str(env_path),
             "--config",
             f"source={probe_config},target=/run/olivium/http-health-probe,mode=0555",
-            "--health-cmd",
-            (
-                "/run/olivium/http-health-probe --url "
-                f"http://127.0.0.1:{service['internalPort']}{service['healthPath']}"
-            ),
-            "--health-interval",
-            "10s",
-            "--health-timeout",
-            "5s",
-            "--health-retries",
-            "60",
-            "--health-start-period",
-            "20s",
             "--restart-condition",
             "any",
             "--limit-cpu",
@@ -822,7 +835,7 @@ def deploy(args: argparse.Namespace) -> None:
     for service in ordered:
         name = f"{prefix}-{service['id']}"
         try:
-            wait_service(name, healthy=True, timeout=1200)
+            wait_application(name, int(service["internalPort"]), service["healthPath"], timeout=1200)
             print(f"healthy: {service['id']}", flush=True)
         except DeployError:
             failures.append(service["id"])
@@ -833,7 +846,11 @@ def deploy(args: argparse.Namespace) -> None:
 
     docker("logout", "ghcr.io", check=False)
     gateway = f"{prefix}-jeeb-gateway"
-    require(wait_service(gateway, healthy=True, timeout=60), "gateway is not healthy")
+    gateway_service = next(item for item in ordered if item["id"] == "jeeb-gateway")
+    require(
+        wait_application(gateway, int(gateway_service["internalPort"]), gateway_service["healthPath"], timeout=60),
+        "gateway is not healthy",
+    )
     probe = run(
         [str(args.health_probe), "--url", "http://127.0.0.1:10000/health/ready"],
         capture=True,

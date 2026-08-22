@@ -241,6 +241,30 @@ class OperationalContractTests(unittest.TestCase):
             result["CaseManagement__GatewayCallbackUrl"],
         )
 
+    def test_application_health_probe_is_exec_form_without_a_shell(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
+        with (
+            mock.patch.object(operational_guest, "wait_service", return_value="container-id"),
+            mock.patch.object(operational_guest, "docker", return_value=completed) as docker,
+        ):
+            container_id = operational_guest.wait_application(
+                "jeeb-eph-test-jeeb-state-service",
+                8080,
+                "/health/ready",
+                timeout=30,
+            )
+
+        self.assertEqual("container-id", container_id)
+        docker.assert_called_once_with(
+            "exec",
+            "container-id",
+            "/run/olivium/http-health-probe",
+            "--url",
+            "http://127.0.0.1:8080/health/ready",
+            capture=True,
+            check=False,
+        )
+
     def test_materialized_mounts_preserve_non_root_ownership(self) -> None:
         template = {
             "secrets": {"state-token": "secret-value"},
