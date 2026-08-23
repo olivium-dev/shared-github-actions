@@ -140,6 +140,27 @@ class OperationalContractTests(unittest.TestCase):
             "https://ephemeral.fds-8.space/?action=extend&lease=$LEASE_ID",
             workflow,
         )
+        self.assertIn("super_login_passcode:\n        required: true", workflow)
+        self.assertIn(
+            "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}",
+            workflow,
+        )
+
+    def test_protected_super_login_passcode_is_required_and_not_logged(self) -> None:
+        valid = {
+            "JEEB_EPHEMERAL_GHCR_TOKEN": "token-that-is-long-enough",
+            "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
+            "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
+        }
+        with mock.patch.dict(os.environ, valid, clear=True):
+            self.assertEqual(
+                (valid["JEEB_EPHEMERAL_GHCR_TOKEN"], valid["JEEB_EPHEMERAL_STAGE_TEMPLATE_B64"], valid["JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE"]),
+                operational_orchestrate.protected_deployment_credentials(),
+            )
+        invalid = {**valid, "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": ""}
+        with mock.patch.dict(os.environ, invalid, clear=True):
+            with self.assertRaisesRegex(operational_orchestrate.ContractError, "passcode is unavailable"):
+                operational_orchestrate.protected_deployment_credentials()
 
     def test_manager_get_retries_a_transient_read_timeout(self) -> None:
         client = manager_client.ManagerClient(
@@ -235,6 +256,7 @@ class OperationalContractTests(unittest.TestCase):
                 "privateIp": "192.168.2.160",
             }
             uploaded: dict[str, bytes] = {}
+            guest_credentials: dict[str, str] = {}
             commands: list[list[str]] = []
 
             def fake_transport(argv: list[str], *, stdin: bytes | None = None, timeout: int = 1800) -> str:
@@ -248,6 +270,7 @@ class OperationalContractTests(unittest.TestCase):
                     path = command.removeprefix("sha256sum -- ")
                     return hashlib.sha256(uploaded[path]).hexdigest() + "  " + path
                 elif command.startswith("sudo python3 "):
+                    guest_credentials.update(json.loads(stdin or b"{}"))
                     return '{"ok":true}'
                 return ""
 
@@ -258,6 +281,7 @@ class OperationalContractTests(unittest.TestCase):
                     {
                         "JEEB_EPHEMERAL_GHCR_TOKEN": "token-that-is-long-enough",
                         "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
+                        "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
                         "GITHUB_ACTOR": "tester",
                     },
                 ),
@@ -279,6 +303,7 @@ class OperationalContractTests(unittest.TestCase):
             self.assertNotIn("*", install)
             self.assertIn("operational_guest.py", install)
             self.assertIn("operational_seed.py", install)
+            self.assertEqual("ephemeral-only-passcode", guest_credentials["superLoginPasscode"])
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
@@ -397,6 +422,7 @@ class OperationalContractTests(unittest.TestCase):
             template,
             postgres_password="postgres-password",
             mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
             public_hostname="eph-bright-pikachu-42.fds-8.space",
             private_ip="192.168.2.160",
             gateway_routes=[
@@ -416,6 +442,7 @@ class OperationalContractTests(unittest.TestCase):
             {"env": ["CaseManagement__GatewayCallbackUrl=http://192.168.2.20:10000/old"]},
             postgres_password="postgres-password",
             mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
             public_hostname="eph-bright-pikachu-42.fds-8.space",
             private_ip="192.168.2.160",
             gateway_routes=[],
@@ -432,6 +459,7 @@ class OperationalContractTests(unittest.TestCase):
             {"env": ["DATABASE_URL=postgresql://staging.invalid/delivery"]},
             postgres_password="postgres-password",
             mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
             public_hostname="eph-bright-pikachu-42.fds-8.space",
             private_ip="192.168.2.160",
             gateway_routes=[],
@@ -441,6 +469,20 @@ class OperationalContractTests(unittest.TestCase):
             "postgresql://oudaykhaled:postgres-password@postgresql:5432/delivery_staging?sslmode=disable",
             result["DATABASE_URL"],
         )
+
+    def test_user_management_uses_the_protected_ephemeral_super_login_passcode(self) -> None:
+        result = operational_guest.transformed_environment(
+            {"id": "user-management"},
+            {"env": ["SuperAdmin__PassCode=staging-value"]},
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-bright-pikachu-42.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+
+        self.assertEqual("ephemeral-only-passcode", result["SuperAdmin__PassCode"])
 
     def test_offer_migration_ledger_matches_the_pinned_service_schema(self) -> None:
         completed = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
@@ -505,6 +547,7 @@ class OperationalContractTests(unittest.TestCase):
                 deployment_id="jeeb-gh-1-1",
                 postgres_password="postgres-password",
                 mongo_password="mongo-password",
+                super_login_passcode="ephemeral-only-passcode",
                 public_hostname="eph-bright-pikachu-42.fds-8.space",
                 private_ip="192.168.2.160",
                 probe_config="jeeb-eph-test-http-health-probe",

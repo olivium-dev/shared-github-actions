@@ -28,6 +28,8 @@ on:
         required: true
       ghcr_token:
         required: true
+      super_login_passcode:
+        required: true
     outputs:
       lease_id:
         value: ${{ jobs.deploy.outputs.lease_id }}
@@ -111,6 +113,7 @@ jobs:
         env:
           JEEB_EPHEMERAL_STAGE_TEMPLATE_B64: ${{ secrets.stage_template_b64 }}
           JEEB_EPHEMERAL_GHCR_TOKEN: ${{ secrets.ghcr_token }}
+          JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}
           MANAGER_URL: https://ephemeral.fds-8.space
           MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
           EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
