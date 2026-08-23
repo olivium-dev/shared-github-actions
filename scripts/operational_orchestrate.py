@@ -91,6 +91,20 @@ def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
+def protected_deployment_credentials() -> tuple[str, str, str]:
+    ghcr_token = os.environ.get("JEEB_EPHEMERAL_GHCR_TOKEN", "")
+    stage_template = os.environ.get("JEEB_EPHEMERAL_STAGE_TEMPLATE_B64", "")
+    super_login_passcode = os.environ.get("JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE", "")
+    require(len(ghcr_token) >= 20 and len(stage_template) >= 100, "protected deployment secrets are unavailable")
+    require(
+        6 <= len(super_login_passcode) <= 128
+        and super_login_passcode == super_login_passcode.strip()
+        and super_login_passcode.isprintable(),
+        "protected ephemeral super-login passcode is unavailable",
+    )
+    return ghcr_token, stage_template, super_login_passcode
+
+
 def validate_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], int, str]:
     config = load_json(args.config)
     catalog = load_json(args.catalog)
@@ -342,13 +356,12 @@ def upload_runtime(
         f"{shlex.quote(remote_root + '/http-health-probe')}"
     )
     transport(["ssh", *options, destination, install_command])
-    ghcr_token = os.environ.get("JEEB_EPHEMERAL_GHCR_TOKEN", "")
-    stage_template = os.environ.get("JEEB_EPHEMERAL_STAGE_TEMPLATE_B64", "")
-    require(len(ghcr_token) >= 20 and len(stage_template) >= 100, "protected deployment secrets are unavailable")
+    ghcr_token, _, super_login_passcode = protected_deployment_credentials()
     credentials = canonical(
         {
             "ghcrActor": os.environ.get("GITHUB_ACTOR", ""),
             "ghcrToken": ghcr_token,
+            "superLoginPasscode": super_login_passcode,
         }
     )
     command = (
@@ -441,9 +454,7 @@ def save_state(path: Path, lease: dict[str, Any] | None, lock_hash: str) -> None
 
 def run_deployment(args: argparse.Namespace) -> None:
     config, catalog, ttl, zone = validate_inputs(args)
-    ghcr_token = os.environ.get("JEEB_EPHEMERAL_GHCR_TOKEN", "")
-    stage_template = os.environ.get("JEEB_EPHEMERAL_STAGE_TEMPLATE_B64", "")
-    require(len(ghcr_token) >= 20 and len(stage_template) >= 100, "protected deployment secrets are unavailable")
+    _, stage_template, _ = protected_deployment_credentials()
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")

@@ -382,6 +382,7 @@ def transformed_environment(
     *,
     postgres_password: str,
     mongo_password: str,
+    super_login_passcode: str,
     public_hostname: str,
     private_ip: str,
     gateway_routes: list[dict[str, Any]],
@@ -416,6 +417,10 @@ def transformed_environment(
             elif key == "DATABASE_URL":
                 environment[key] = database_url(service_id, postgres_password)
         environment["SKIP_DB_INIT"] = "true"
+
+    if service_id == "user-management":
+        require(super_login_passcode, "ephemeral super-login passcode is unavailable")
+        environment["SuperAdmin__PassCode"] = super_login_passcode
 
     if service_id == "notification-service":
         environment["DB_PASSWORD"] = mongo_password
@@ -1018,6 +1023,7 @@ def create_application(
     deployment_id: str,
     postgres_password: str,
     mongo_password: str,
+    super_login_passcode: str,
     public_hostname: str,
     private_ip: str,
     probe_config: str,
@@ -1030,6 +1036,7 @@ def create_application(
         template_service,
         postgres_password=postgres_password,
         mongo_password=mongo_password,
+        super_login_passcode=super_login_passcode,
         public_hostname=public_hostname,
         private_ip=private_ip,
         gateway_routes=catalog["gatewayRouting"],
@@ -1230,7 +1237,15 @@ def deploy(args: argparse.Namespace) -> None:
     credentials = json.load(sys.stdin)
     actor = credentials.get("ghcrActor")
     token = credentials.get("ghcrToken")
+    super_login_passcode = credentials.get("superLoginPasscode")
     require(isinstance(actor, str) and actor and isinstance(token, str) and len(token) >= 20, "GHCR credentials missing")
+    require(
+        isinstance(super_login_passcode, str)
+        and 6 <= len(super_login_passcode) <= 128
+        and super_login_passcode == super_login_passcode.strip()
+        and super_login_passcode.isprintable(),
+        "ephemeral super-login passcode missing",
+    )
     docker("login", "ghcr.io", "-u", actor, "--password-stdin", stdin=token.encode())
 
     state_dir = Path("/var/lib/olivium-ephemeral")
@@ -1281,6 +1296,7 @@ def deploy(args: argparse.Namespace) -> None:
             deployment_id=args.deployment_id,
             postgres_password=postgres_password,
             mongo_password=mongo_password,
+            super_login_passcode=super_login_passcode,
             public_hostname=public_hostname,
             private_ip=str(private_ip),
             probe_config=probe_config,
