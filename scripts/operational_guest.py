@@ -1183,7 +1183,7 @@ def gateway_json(path: str, *, payload: dict[str, Any] | None = None, token: str
                 parse_constant=reject_nonfinite_json_number,
             )
     except urllib.error.HTTPError as exc:
-        exc.read()
+        exc.close()
         raise DeployError(f"gateway seed validation failed for {path} (status {exc.code})") from exc
     except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
         raise DeployError(f"gateway seed validation failed for {path}") from exc
