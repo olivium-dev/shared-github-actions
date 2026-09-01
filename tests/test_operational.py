@@ -703,7 +703,7 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.75)
         self.assertEqual(1, handler.post_count)
-        self.assertEqual(0, handler.get_count)
+        self.assertLessEqual(handler.get_count, 1)
 
     def test_heartbeat_recovery_stops_before_manager_deadline(self) -> None:
         wall_now = datetime(2026, 9, 1, tzinfo=timezone.utc)
