@@ -1118,6 +1118,27 @@ class OperationalContractTests(unittest.TestCase):
         client.progress_once_before.assert_called_once()
         client.lease_once_before.assert_not_called()
 
+    def test_manager_deadline_accepts_dotnet_seven_digit_fraction_on_python_310(self) -> None:
+        parsed = operational_orchestrate.parse_manager_deadline(
+            "2026-09-01T17:57:20.3452139+00:00"
+        )
+
+        self.assertEqual(
+            datetime(2026, 9, 1, 17, 57, 20, 345213, tzinfo=timezone.utc),
+            parsed,
+        )
+
+    def test_manager_deadline_remains_strict_and_timezone_aware(self) -> None:
+        invalid = (
+            "2026-09-01 17:57:20.3452139+00:00",
+            "2026-09-01T17:57:20.3452139",
+            "2026-09-01T17:57:20.1234567890+00:00",
+            "2026-09-01T25:57:20.3452139+00:00",
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(operational_orchestrate.ContractError):
+                operational_orchestrate.parse_manager_deadline(value)
+
     def test_detached_guest_deploy_survives_a_transient_poll_disconnect(self) -> None:
         poll_attempts = 0
 

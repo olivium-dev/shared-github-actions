@@ -40,10 +40,30 @@ HEARTBEAT_OPERATION_BUDGET_SECONDS = 60.0
 HEARTBEAT_DEADLINE_SAFETY_SECONDS = 10.0
 HEARTBEAT_PROGRESS_ATTEMPTS = 2
 HEARTBEAT_RECONCILIATION_ATTEMPTS = 3
+MANAGER_DEADLINE = re.compile(
+    r"^(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r"(?:\.(?P<fraction>[0-9]{1,9}))?(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})$"
+)
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def parse_manager_deadline(value: Any) -> datetime:
+    require(isinstance(value, str), "manager lease heartbeatDeadline is missing")
+    match = MANAGER_DEADLINE.fullmatch(value)
+    require(match is not None, "manager lease heartbeatDeadline is invalid")
+    fraction = match.group("fraction")
+    fraction_part = f".{(fraction + '000000')[:6]}" if fraction else ""
+    zone = "+00:00" if match.group("zone") == "Z" else match.group("zone")
+    normalized = f"{match.group('date')}{fraction_part}{zone}"
+    try:
+        deadline = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ContractError("manager lease heartbeatDeadline is invalid") from exc
+    require(deadline.tzinfo is not None, "manager lease heartbeatDeadline must include a timezone")
+    return deadline
 
 
 class Heartbeat:
@@ -123,13 +143,7 @@ class Heartbeat:
         raise ContractError(f"manager heartbeat failed after reconciliation: {last_error}")
 
     def _operation_deadline(self) -> float:
-        raw_deadline = self.lease.get("heartbeatDeadline")
-        require(isinstance(raw_deadline, str), "manager lease heartbeatDeadline is missing")
-        try:
-            manager_deadline = datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ContractError("manager lease heartbeatDeadline is invalid") from exc
-        require(manager_deadline.tzinfo is not None, "manager lease heartbeatDeadline must include a timezone")
+        manager_deadline = parse_manager_deadline(self.lease.get("heartbeatDeadline"))
         manager_budget = (manager_deadline - utc_now()).total_seconds() - HEARTBEAT_DEADLINE_SAFETY_SECONDS
         require(manager_budget > 0, "manager lease heartbeat deadline is too close for a safe progress request")
         return time.monotonic() + min(HEARTBEAT_OPERATION_BUDGET_SECONDS, manager_budget)
