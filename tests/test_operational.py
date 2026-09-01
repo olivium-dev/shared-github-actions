@@ -393,6 +393,7 @@ class OperationalContractTests(unittest.TestCase):
             operational_guest.coroot_agent_address(
                 {
                     "NetworkSettings": {
+                        "IPAddress": "172.17.0.99",
                         "Networks": {
                             "bridge": {"IPAddress": "172.17.0.3"},
                             "secondary": {"IPAddress": "172.18.0.3"},
@@ -416,6 +417,16 @@ class OperationalContractTests(unittest.TestCase):
             "missing": {},
             "malformed": {"NetworkSettings": {"Networks": []}},
             "empty": {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": ""}}}},
+            "malformed-address": {
+                "NetworkSettings": {
+                    "Networks": {"bridge": {"IPAddress": "not-an-ip"}}
+                }
+            },
+            "public-address": {
+                "NetworkSettings": {
+                    "Networks": {"bridge": {"IPAddress": "8.8.8.8"}}
+                }
+            },
             "ambiguous": {
                 "NetworkSettings": {
                     "Networks": {
@@ -429,7 +440,8 @@ class OperationalContractTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaisesRegex(
                     operational_guest.DeployError,
-                    "network inspection|unambiguous private container address",
+                    "network inspection|unambiguous private container address|"
+                    "private container address is invalid|must be private IPv4",
                 ):
                     operational_guest.coroot_agent_address(inspect_row)
 

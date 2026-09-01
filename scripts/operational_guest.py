@@ -569,18 +569,18 @@ def coroot_agent_address(inspect_row: dict[str, Any]) -> str:
     network_settings = inspect_row.get("NetworkSettings")
     require(isinstance(network_settings, dict), "Coroot agent network inspection is unavailable")
 
-    legacy = network_settings.get("IPAddress")
-    if isinstance(legacy, str) and legacy:
-        return legacy
-
     networks = network_settings.get("Networks")
-    require(isinstance(networks, dict), "Coroot agent network inspection is unavailable")
-    bridge = networks.get("bridge")
+    bridge = networks.get("bridge") if isinstance(networks, dict) else None
     if isinstance(bridge, dict):
         address = bridge.get("IPAddress")
         if isinstance(address, str) and address:
-            return address
+            return validated_coroot_agent_address(address)
 
+    legacy = network_settings.get("IPAddress")
+    if isinstance(legacy, str) and legacy:
+        return validated_coroot_agent_address(legacy)
+
+    require(isinstance(networks, dict), "Coroot agent network inspection is unavailable")
     addresses = {
         details.get("IPAddress")
         for details in networks.values()
@@ -589,7 +589,19 @@ def coroot_agent_address(inspect_row: dict[str, Any]) -> str:
         and details.get("IPAddress")
     }
     require(len(addresses) == 1, "Coroot agent has no unambiguous private container address")
-    return addresses.pop()
+    return validated_coroot_agent_address(addresses.pop())
+
+
+def validated_coroot_agent_address(value: str) -> str:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise DeployError("Coroot agent private container address is invalid") from exc
+    require(
+        address.version == 4 and address.is_private,
+        "Coroot agent private container address must be private IPv4",
+    )
+    return str(address)
 
 
 def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
