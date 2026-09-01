@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.server
 import io
@@ -106,6 +107,58 @@ def start_slow_drip_server(body: bytes, delay_seconds: float, status: int = 200)
     return server, thread, SlowDripHandler
 
 
+def start_chunked_oversize_server() -> tuple:
+    class ChunkedHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for _ in range(64):
+                    chunk = b"x" * 4096
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ChunkedHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def start_oversized_header_server() -> tuple:
+    class OversizedHeaderHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            for index in range(64):
+                self.send_header(f"X-Oversized-{index}", "x" * 1024)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            try:
+                self.wfile.write(b"{}")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OversizedHeaderHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
 def start_reflecting_error_server() -> tuple:
     class ReflectingErrorHandler(http.server.BaseHTTPRequestHandler):
         def _respond(self) -> None:
@@ -130,6 +183,87 @@ def start_reflecting_error_server() -> tuple:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
+
+
+def manager_test_jwt(audience: str) -> str:
+    claims = {
+        "aud": audience,
+        "environment": "test",
+        "job_workflow_ref": "workflow-ref",
+        "job_workflow_sha": "a" * 40,
+        "ref_protected": "true",
+        "repository_owner": "olivium-dev",
+        "runner_environment": "github-hosted",
+    }
+
+    def segment(value: dict) -> str:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{segment({'alg': 'none'})}.{segment(claims)}.signature"
+
+
+def start_heartbeat_server(lease: dict, audience: str, request_token: str) -> tuple:
+    manager_token = manager_test_jwt(audience)
+
+    class HeartbeatHandler(http.server.BaseHTTPRequestHandler):
+        current = dict(lease)
+        errors: list[str] = []
+        oidc_count = 0
+        progress_count = 0
+        lock = threading.Lock()
+
+        def _json(self, status: int, value: object) -> None:
+            body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if not self.path.startswith("/oidc?"):
+                self._json(404, {"error": "not found"})
+                return
+            if self.headers.get("Authorization") != f"Bearer {request_token}":
+                type(self).errors.append("OIDC authorization mismatch")
+                self._json(401, {"error": "unauthorized"})
+                return
+            with type(self).lock:
+                type(self).oidc_count += 1
+            self._json(200, {"value": manager_token})
+
+        def do_POST(self) -> None:
+            if self.headers.get("Authorization") != f"Bearer {manager_token}":
+                type(self).errors.append("manager authorization mismatch")
+                self._json(401, {"error": "unauthorized"})
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(size))
+            except (ValueError, json.JSONDecodeError):
+                type(self).errors.append("invalid progress body")
+                self._json(400, {"error": "invalid body"})
+                return
+            with type(self).lock:
+                current = dict(type(self).current)
+                current["state"] = body.get("phase")
+                current["stateVersion"] += 1
+                current["heartbeatDeadline"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=120)
+                ).isoformat()
+                type(self).current = current
+                type(self).progress_count += 1
+            self._json(200, current)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HeartbeatHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, HeartbeatHandler
 
 
 def seed_data() -> dict:
@@ -354,7 +488,7 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.75)
 
-    def test_trusted_request_worker_can_run_from_the_heartbeat_thread(self) -> None:
+    def test_trusted_request_transport_runs_from_a_daemon_heartbeat_thread(self) -> None:
         server, server_thread, _ = start_slow_drip_server(b'{"ok":true}', 0.0)
         result: list[object] = []
 
@@ -370,7 +504,7 @@ class OperationalContractTests(unittest.TestCase):
             except Exception as exc:  # pragma: no cover - assertion captures the type
                 result.append(exc)
 
-        request_thread = threading.Thread(target=request_from_thread)
+        request_thread = threading.Thread(target=request_from_thread, daemon=True)
         try:
             request_thread.start()
             request_thread.join(timeout=3)
@@ -381,6 +515,95 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertFalse(request_thread.is_alive())
         self.assertEqual([{"ok": True}], result)
+
+    def test_curl_transport_keeps_bearer_and_body_out_of_argv_and_environment(self) -> None:
+        opaque_token = "opaque-process-secret-that-must-not-escape"
+        body_secret = "opaque-body-secret-that-must-not-escape"
+        server, server_thread, _ = start_slow_drip_server(b'{"ok":true}', 0.0)
+        original_popen = common.subprocess.Popen
+        captured: dict[str, object] = {}
+
+        def capture(argv: list[str], **kwargs: object) -> subprocess.Popen:
+            config_path = Path(argv[-1])
+            captured["argv"] = list(argv)
+            captured["environment"] = dict(kwargs.get("env", {}))
+            captured["config"] = config_path.read_text(encoding="utf-8")
+            captured["config_mode"] = stat.S_IMODE(config_path.stat().st_mode)
+            captured["directory_mode"] = stat.S_IMODE(config_path.parent.stat().st_mode)
+            return original_popen(argv, **kwargs)
+
+        try:
+            with mock.patch.object(common.subprocess, "Popen", side_effect=capture):
+                payload, _ = common.request_json(
+                    "POST",
+                    f"http://127.0.0.1:{server.server_port}/manager",
+                    bearer=opaque_token,
+                    body={"secret": body_secret},
+                    timeout=2.0,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+        self.assertEqual({"ok": True}, payload)
+        self.assertNotIn(opaque_token, json.dumps(captured["argv"]))
+        self.assertNotIn(body_secret, json.dumps(captured["argv"]))
+        self.assertNotIn(opaque_token, json.dumps(captured["environment"]))
+        self.assertNotIn(body_secret, json.dumps(captured["environment"]))
+        self.assertIn(opaque_token, captured["config"])
+        self.assertNotIn(body_secret, captured["config"])
+        self.assertEqual(0o600, captured["config_mode"])
+        self.assertEqual(0o700, captured["directory_mode"])
+
+    def test_curl_transport_bounds_chunked_body_without_content_length(self) -> None:
+        server, server_thread = start_chunked_oversize_server()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(common.ContractError, "response exceeded the size limit"):
+                common.bounded_request(
+                    "GET",
+                    f"http://127.0.0.1:{server.server_port}/chunked",
+                    headers={"Accept": "application/json"},
+                    data=None,
+                    timeout=2.0,
+                    max_response_bytes=1024,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+        self.assertLess(elapsed, 1.0)
+
+    def test_curl_transport_bounds_response_headers_before_parsing(self) -> None:
+        server, server_thread = start_oversized_header_server()
+        try:
+            with self.assertRaisesRegex(common.ContractError, "response headers exceeded the size limit"):
+                common.bounded_request(
+                    "GET",
+                    f"http://127.0.0.1:{server.server_port}/headers",
+                    headers={"Accept": "application/json"},
+                    data=None,
+                    timeout=2.0,
+                    max_response_bytes=1024,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+    def test_curl_transport_rejects_header_config_injection(self) -> None:
+        with self.assertRaisesRegex(common.ContractError, "control characters"):
+            common.bounded_request(
+                "GET",
+                "http://127.0.0.1:1/test",
+                headers={"Authorization": "Bearer safe\noutput = /tmp/unsafe"},
+                data=None,
+                timeout=1.0,
+                max_response_bytes=1024,
+            )
 
     def test_oidc_request_enforces_absolute_deadline_against_slow_drip(self) -> None:
         server, thread, _ = start_slow_drip_server(b'{"value":"' + b"x" * 100 + b'"}', 0.05)
@@ -635,6 +858,63 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(5, result["stateVersion"])
         self.assertEqual(2, client.progress_once_before.call_count)
         client.lease_once_before.assert_called_once()
+
+    def test_real_daemon_heartbeat_renews_through_oidc_and_manager_http(self) -> None:
+        audience = "test-audience"
+        request_token = "oidc-request-token-not-real"
+        lease = heartbeat_lease(state="infrastructure_ready")
+        server, server_thread, handler = start_heartbeat_server(lease, audience, request_token)
+        client = manager_client.ManagerClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            audience=audience,
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        heartbeat = operational_orchestrate.Heartbeat(client, lease, interval_seconds=0.05)
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ACTIONS_ID_TOKEN_REQUEST_URL": f"http://127.0.0.1:{server.server_port}/oidc",
+                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN": request_token,
+                },
+                clear=True,
+            ):
+                heartbeat.start()
+                deadline = time.monotonic() + 3.0
+                while handler.progress_count < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                heartbeat.stop()
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+        self.assertEqual([], handler.errors)
+        self.assertGreaterEqual(handler.oidc_count, 2)
+        self.assertGreaterEqual(handler.progress_count, 2)
+        self.assertGreaterEqual(heartbeat.snapshot()["stateVersion"], 6)
+
+    def test_daemon_heartbeat_failure_is_logged_without_exception_details(self) -> None:
+        secret = "opaque-heartbeat-failure-secret"
+        client = mock.Mock()
+        client.progress_once_before.side_effect = operational_orchestrate.ContractError(secret)
+        heartbeat = operational_orchestrate.Heartbeat(client, heartbeat_lease(), interval_seconds=0.01)
+        stderr = io.StringIO()
+
+        with mock.patch.object(sys, "stderr", stderr):
+            heartbeat.start()
+            heartbeat._thread.join(timeout=1)
+            with self.assertRaises(operational_orchestrate.ContractError) as raised:
+                heartbeat.stop()
+
+        event = stderr.getvalue()
+        self.assertIn('"event": "manager_heartbeat_failed"', event)
+        self.assertIn('"errorType": "ContractError"', event)
+        self.assertNotIn(secret, event)
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_heartbeat_accepts_a_progress_response_lost_after_commit(self) -> None:
         lease = heartbeat_lease()

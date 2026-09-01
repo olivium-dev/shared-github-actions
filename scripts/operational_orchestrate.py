@@ -80,7 +80,7 @@ class Heartbeat:
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:
-            raise ContractError(f"manager heartbeat failed: {self._error}")
+            raise ContractError(f"manager heartbeat failed ({type(self._error).__name__})") from None
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
@@ -90,6 +90,14 @@ class Heartbeat:
             except Exception as exc:
                 with self._lock:
                     self._error = exc
+                print(
+                    json.dumps(
+                        {"event": "manager_heartbeat_failed", "errorType": type(exc).__name__},
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self._stop.set()
                 return
 
