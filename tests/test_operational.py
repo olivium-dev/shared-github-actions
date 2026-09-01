@@ -340,6 +340,19 @@ class OperationalContractTests(unittest.TestCase):
             self.assertEqual("sk-ephemeral-test-key-not-real", guest_credentials["openAiApiKey"])
             self.assertEqual("coroot-ephemeral-test-key-not-real", guest_credentials["corootApiKey"])
 
+    def test_cloudflare_ssh_keeps_long_guest_deployments_alive(self) -> None:
+        options = operational_orchestrate.ssh_options(
+            Path("/tmp/cloudflared"),
+            Path("/tmp/id_ed25519"),
+            Path("/tmp/known_hosts"),
+        )
+
+        self.assertIn("ServerAliveInterval=15", options)
+        self.assertIn("ServerAliveCountMax=12", options)
+        self.assertIn("TCPKeepAlive=yes", options)
+        self.assertIn("StrictHostKeyChecking=yes", options)
+        self.assertIn("HostKeyAlgorithms=ssh-ed25519", options)
+
     def test_coroot_agent_is_pinned_privileged_private_and_secret_file_backed(self) -> None:
         api_key = "coroot-ephemeral-test-key-not-real"
         completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
