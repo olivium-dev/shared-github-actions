@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -142,12 +143,17 @@ class OperationalContractTests(unittest.TestCase):
         )
         self.assertIn("super_login_passcode:\n        required: true", workflow)
         self.assertIn("openai_api_key:\n        required: true", workflow)
+        self.assertIn("coroot_api_key:\n        required: true", workflow)
         self.assertIn(
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}",
             workflow,
         )
         self.assertIn(
             "JEEB_EPHEMERAL_OPENAI_API_KEY: ${{ secrets.openai_api_key }}",
+            workflow,
+        )
+        self.assertIn(
+            "JEEB_EPHEMERAL_COROOT_API_KEY: ${{ secrets.coroot_api_key }}",
             workflow,
         )
 
@@ -157,6 +163,7 @@ class OperationalContractTests(unittest.TestCase):
             "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
             "JEEB_EPHEMERAL_OPENAI_API_KEY": "sk-ephemeral-test-key-not-real",
+            "JEEB_EPHEMERAL_COROOT_API_KEY": "coroot-ephemeral-test-key-not-real",
         }
         with mock.patch.dict(os.environ, valid, clear=True):
             self.assertEqual(
@@ -165,6 +172,7 @@ class OperationalContractTests(unittest.TestCase):
                     valid["JEEB_EPHEMERAL_STAGE_TEMPLATE_B64"],
                     valid["JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE"],
                     valid["JEEB_EPHEMERAL_OPENAI_API_KEY"],
+                    valid["JEEB_EPHEMERAL_COROOT_API_KEY"],
                 ),
                 operational_orchestrate.protected_deployment_credentials(),
             )
@@ -294,6 +302,7 @@ class OperationalContractTests(unittest.TestCase):
                         "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
                         "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
                         "JEEB_EPHEMERAL_OPENAI_API_KEY": "sk-ephemeral-test-key-not-real",
+                        "JEEB_EPHEMERAL_COROOT_API_KEY": "coroot-ephemeral-test-key-not-real",
                         "GITHUB_ACTOR": "tester",
                     },
                 ),
@@ -317,6 +326,56 @@ class OperationalContractTests(unittest.TestCase):
             self.assertIn("operational_seed.py", install)
             self.assertEqual("ephemeral-only-passcode", guest_credentials["superLoginPasscode"])
             self.assertEqual("sk-ephemeral-test-key-not-real", guest_credentials["openAiApiKey"])
+            self.assertEqual("coroot-ephemeral-test-key-not-real", guest_credentials["corootApiKey"])
+
+    def test_coroot_agent_is_pinned_privileged_private_and_secret_file_backed(self) -> None:
+        api_key = "coroot-ephemeral-test-key-not-real"
+        completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+            "NetworkSettings": {"IPAddress": "172.17.0.2"},
+        }
+        calls: list[tuple] = []
+
+        def fake_docker(*arguments: str, **kwargs: object) -> SimpleNamespace:
+            calls.append(arguments)
+            if arguments[:2] == ("container", "inspect"):
+                if sum(1 for call in calls if call[:2] == ("container", "inspect")) == 1:
+                    return completed
+                return SimpleNamespace(returncode=0, stdout=json.dumps([running]).encode(), stderr=b"")
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        with tempfile.TemporaryDirectory() as temporary_name:
+            state_dir = Path(temporary_name)
+            with (
+                mock.patch.object(operational_guest, "docker", side_effect=fake_docker),
+                mock.patch.object(operational_guest.urllib.request, "urlopen") as urlopen,
+            ):
+                urlopen.return_value.__enter__.return_value.status = 200
+                urlopen.return_value.__enter__.return_value.read.return_value = b"node_agent_info 1\n"
+                operational_guest.deploy_coroot_node_agent(
+                    state_dir=state_dir,
+                    api_key=api_key,
+                    lease_id="bright-pikachu-42",
+                    lock_hash="a" * 64,
+                    deployment_id="jeeb-gh-1-1",
+                )
+
+            key_path = state_dir / "coroot" / "api-key"
+            self.assertEqual(api_key, key_path.read_text())
+            self.assertEqual(0o400, stat.S_IMODE(key_path.stat().st_mode))
+            operational_guest.write_restricted_secret(key_path, api_key)
+
+        run_call = next(call for call in calls if call and call[0] == "run")
+        serialized = " ".join(run_call)
+        self.assertIn(operational_guest.COROOT_NODE_AGENT_IMAGE, run_call)
+        self.assertIn("--privileged", run_call)
+        self.assertIn("host", run_call)
+        self.assertNotIn(api_key, serialized)
+        self.assertNotIn("--publish", run_call)
+        self.assertIn("/run/secrets/coroot-api-key", serialized)
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
