@@ -69,6 +69,7 @@ TRANSIENT_PULL_ERRORS = (
     "network is unreachable",
 )
 LEGACY_FAKE_VOICE_COMMIT = "8f76393982e224306a30a067636109d3573f2f8b"
+EPHEMERAL_WALLET_CURRENCY_ID = 1
 POSTGRES_DATABASES = {
     "jeeb-state-service": "jeeb_state_staging",
     "user-management": "jeeb-user-management_staging",
@@ -623,6 +624,7 @@ def transformed_environment(
     if service_id == "jeeb-gateway":
         environment["ASPNETCORE_ENVIRONMENT"] = "Ephemeral"
         environment["DOTNET_ENVIRONMENT"] = "Ephemeral"
+        environment["PartnerWallet__CurrencyId"] = str(EPHEMERAL_WALLET_CURRENCY_ID)
         environment["Features__RealtimeWebSocketProxy__Enabled"] = "false"
         environment["FeatureFlags__NotificationDurableWrite__Enabled"] = "true"
         environment["PushNotificationServiceApi__GatewayApiKeyFile"] = (
@@ -1210,8 +1212,16 @@ def validate_seed_gateway(config: dict[str, Any], prefix: str) -> None:
     for jeeber in (user for user in seed_data["users"] if user["type"] == "jeeber"):
         wallet = gateway_json("/v1/jeeb/wallet", token=login_tokens[jeeber["id"]])
         require(isinstance(wallet, dict) and "availableBalance" in wallet, "Jeeber wallet response is invalid")
+        expected_balance = sum(
+            (
+                Decimal(seed_wallet["balance"])
+                for seed_wallet in jeeber["wallets"]
+                if seed_wallet["currencyId"] == EPHEMERAL_WALLET_CURRENCY_ID
+            ),
+            Decimal("0"),
+        )
         require(
-            Decimal(str(wallet["availableBalance"])) == wallet_total(jeeber),
+            Decimal(str(wallet["availableBalance"])) == expected_balance,
             f"Jeeber public wallet balance does not match seed data for {jeeber['id']}",
         )
 
