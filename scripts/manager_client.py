@@ -152,13 +152,76 @@ class ManagerClient:
         raise ContractError(f"manager job {job_id} did not finish before timeout")
 
     def progress(self, lease: dict[str, Any], phase: str) -> dict[str, Any]:
-        body = {
-            "deploymentId": lease["deploymentId"],
-            "deploymentLockHash": lease["deploymentLockHash"],
-            "stateVersion": lease["stateVersion"],
-            "phase": phase,
-        }
-        return self.request("POST", f"/api/automation/v1/leases/{urllib.parse.quote(lease['leaseId'], safe='')}/progress", body)
+        current = dict(lease)
+        last_error: ContractError | None = None
+        path = f"/api/automation/v1/leases/{urllib.parse.quote(lease['leaseId'], safe='')}/progress"
+        for attempt in range(3):
+            previous_version = current["stateVersion"]
+            body = {
+                "deploymentId": current["deploymentId"],
+                "deploymentLockHash": current["deploymentLockHash"],
+                "stateVersion": previous_version,
+                "phase": phase,
+            }
+            try:
+                return self.request("POST", path, body)
+            except ContractError as exc:
+                if not self._retryable_progress_error(exc):
+                    raise
+                last_error = exc
+
+            try:
+                latest = self.lease(current["leaseId"])
+                self._validate_progress_reconciliation(current, latest, phase)
+                if latest["state"] == phase and latest["stateVersion"] > previous_version:
+                    return latest
+                current = latest
+            except ContractError as exc:
+                last_error = exc
+
+            if attempt + 1 < 3:
+                time.sleep(attempt + 1)
+
+        raise ContractError("manager progress failed after safe reconciliation retries") from last_error
+
+    @staticmethod
+    def _retryable_progress_error(exc: ContractError) -> bool:
+        message = str(exc)
+        return message.startswith(
+            (
+                "manager read failed after transient retries:",
+                "trusted endpoint request failed:",
+                "GitHub OIDC token request failed:",
+                "HTTP 409 from trusted endpoint:",
+                "HTTP 429 from trusted endpoint:",
+                "HTTP 5",
+            )
+        )
+
+    @staticmethod
+    def _validate_progress_reconciliation(
+        previous: dict[str, Any],
+        latest: dict[str, Any],
+        phase: str,
+    ) -> None:
+        require(latest.get("leaseId") == previous.get("leaseId"), "manager progress reconciliation changed lease")
+        require(
+            latest.get("deploymentId") == previous.get("deploymentId"),
+            "manager progress reconciliation changed deployment",
+        )
+        require(
+            latest.get("deploymentLockHash") == previous.get("deploymentLockHash"),
+            "manager progress reconciliation changed deployment lock",
+        )
+        require(
+            latest.get("state") in {previous.get("state"), phase},
+            "manager progress reconciliation found an unexpected lease state",
+        )
+        require(
+            isinstance(latest.get("stateVersion"), int)
+            and latest["stateVersion"] >= previous.get("stateVersion", -1),
+            "manager progress reconciliation regressed state version",
+        )
 
     def access_grant(self, lease: dict[str, Any], nonce: str) -> dict[str, Any]:
         body = {

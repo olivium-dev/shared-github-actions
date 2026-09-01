@@ -234,6 +234,93 @@ class OperationalContractTests(unittest.TestCase):
                 client.request("POST", "/api/automation/v1/leases/one/progress", {})
         self.assertEqual(1, request.call_count)
 
+    def test_manager_progress_reconciles_an_applied_ambiguous_post(self) -> None:
+        client = manager_client.ManagerClient(
+            base_url="http://127.0.0.1:1",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        lease = {
+            "leaseId": "lease-one",
+            "deploymentId": "deployment-one",
+            "deploymentLockHash": "b" * 64,
+            "state": "deploying",
+            "stateVersion": 4,
+        }
+        applied = {**lease, "stateVersion": 5}
+        with mock.patch.object(
+            client,
+            "request",
+            side_effect=[
+                manager_client.ContractError("manager read failed after transient retries: timed out"),
+                applied,
+            ],
+        ) as request:
+            self.assertEqual(applied, client.progress(lease, "deploying"))
+        self.assertEqual(2, request.call_count)
+        self.assertEqual("GET", request.call_args_list[1].args[0])
+
+    def test_manager_progress_retries_from_reconciled_state_version(self) -> None:
+        client = manager_client.ManagerClient(
+            base_url="http://127.0.0.1:1",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        lease = {
+            "leaseId": "lease-one",
+            "deploymentId": "deployment-one",
+            "deploymentLockHash": "b" * 64,
+            "state": "deploying",
+            "stateVersion": 4,
+        }
+        succeeded = {**lease, "stateVersion": 5}
+        with (
+            mock.patch.object(
+                client,
+                "request",
+                side_effect=[
+                    manager_client.ContractError("trusted endpoint request failed: connection reset"),
+                    lease,
+                    succeeded,
+                ],
+            ) as request,
+            mock.patch.object(manager_client.time, "sleep"),
+        ):
+            self.assertEqual(succeeded, client.progress(lease, "deploying"))
+        self.assertEqual(3, request.call_count)
+        self.assertEqual(4, request.call_args_list[2].args[2]["stateVersion"])
+
+    def test_manager_progress_does_not_reconcile_a_contract_violation(self) -> None:
+        client = manager_client.ManagerClient(
+            base_url="http://127.0.0.1:1",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        lease = {
+            "leaseId": "lease-one",
+            "deploymentId": "deployment-one",
+            "deploymentLockHash": "b" * 64,
+            "state": "deploying",
+            "stateVersion": 4,
+        }
+        with mock.patch.object(
+            client,
+            "request",
+            side_effect=manager_client.ContractError("OIDC job_workflow_ref mismatch"),
+        ) as request:
+            with self.assertRaisesRegex(manager_client.ContractError, "job_workflow_ref"):
+                client.progress(lease, "deploying")
+        self.assertEqual(1, request.call_count)
+
     def test_deployment_lock_is_canonical_and_covers_exact_service_set(self) -> None:
         config = operational_config()
         catalog = {
