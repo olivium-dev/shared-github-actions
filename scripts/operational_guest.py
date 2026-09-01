@@ -1210,9 +1210,12 @@ def validate_seed_gateway(config: dict[str, Any], prefix: str) -> None:
     for jeeber in (user for user in seed_data["users"] if user["type"] == "jeeber"):
         wallet = gateway_json("/v1/jeeb/wallet", token=login_tokens[jeeber["id"]])
         require(isinstance(wallet, dict) and "availableBalance" in wallet, "Jeeber wallet response is invalid")
+        actual_balance = Decimal(str(wallet["availableBalance"]))
+        expected_balance = wallet_total(jeeber)
         require(
-            Decimal(str(wallet["availableBalance"])) == wallet_total(jeeber),
-            f"Jeeber public wallet balance does not match seed data for {jeeber['id']}",
+            actual_balance == expected_balance,
+            "Jeeber public wallet balance does not match seed data for "
+            f"{jeeber['id']} (expected={expected_balance}, actual={actual_balance})",
         )
 
     for admin in (user for user in seed_data["users"] if user["type"] == "admin"):

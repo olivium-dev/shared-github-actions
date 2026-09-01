@@ -802,6 +802,40 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual("/v1/jeeb/wallet", gateway.call_args_list[-2].args[0])
         self.assertEqual("/admin/session", gateway.call_args_list[-1].args[0])
 
+    def test_guest_wallet_mismatch_reports_safe_expected_and_actual_balances(self) -> None:
+        seed = seed_data()
+        roster = {
+            "users": [
+                {
+                    "userId": user["id"],
+                    "name": user["username"],
+                    "role": operational_seed.roles_for(user["type"])[1],
+                    "roles": operational_seed.roles_for(user["type"])[0],
+                }
+                for user in seed["users"]
+            ]
+        }
+        responses = [
+            roster,
+            {"authToken": "one.two.three"},
+            {"authToken": "four.five.six"},
+            {"authToken": "seven.eight.nine"},
+            {"availableBalance": 0},
+        ]
+        with (
+            mock.patch.object(operational_guest, "gateway_json", side_effect=responses),
+            mock.patch.object(
+                operational_guest,
+                "service_environment",
+                return_value={"SuperAdmin__PassCode": "not-printed"},
+            ),
+            self.assertRaisesRegex(
+                operational_guest.DeployError,
+                r"expected=112\.75, actual=0",
+            ),
+        ):
+            operational_guest.validate_seed_gateway({"seedData": seed}, "jeeb-eph-test")
+
     def test_environment_rewrites_stage_dependencies_to_the_lease(self) -> None:
         service = {
             "id": "jeeb-gateway",
