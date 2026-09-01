@@ -545,6 +545,12 @@ def transformed_environment(
             "jeeb_notifications_staging?authSource=admin"
         )
         environment["SKIP_DB_INIT"] = "false"
+        environment["PUSH_DELIVERY_REQUIRED"] = "true"
+        environment["DISPATCH_WORKER_ENABLED"] = "true"
+        environment["WEBHOOK_ENABLED"] = "true"
+        environment["WEBHOOK_BASE_URL"] = (
+            "http://push-notification:8080/api/v1/sent-payload/user/"
+        )
         environment["WEBHOOK_AUTH_HEADER_NAME"] = "X-Api-Key"
         environment["WEBHOOK_AUTH_HEADER_VALUE_FILE"] = (
             "/run/secrets/push_notification_delivery_api_key"
