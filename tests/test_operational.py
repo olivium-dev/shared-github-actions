@@ -987,6 +987,7 @@ class OperationalContractTests(unittest.TestCase):
                 super_login_passcode="ephemeral-only-passcode",
                 openai_api_key="sk-ephemeral-test-key-not-real",
                 push_gateway_api_key="ephemeral-push-key-not-real",
+                push_notification_delivery_api_key="ephemeral-notification-key-not-real",
                 public_hostname="eph-bright-pikachu-42.fds-8.space",
                 private_ip="192.168.2.160",
                 probe_config="jeeb-eph-test-http-health-probe",
@@ -1122,6 +1123,7 @@ class OperationalContractTests(unittest.TestCase):
                 postgres_password="postgres-password",
                 openai_api_key="sk-ephemeral-test-key-not-real",
                 push_gateway_api_key="ephemeral-push-key-not-real",
+                push_notification_delivery_api_key="ephemeral-notification-key-not-real",
             )
 
         self.assertEqual("64198", secrets[0]["uid"])
@@ -1161,10 +1163,12 @@ class OperationalContractTests(unittest.TestCase):
                     postgres_password="postgres-password",
                     openai_api_key="sk-ephemeral-test-key-not-real",
                     push_gateway_api_key="ephemeral-push-key-not-real",
+                    push_notification_delivery_api_key="ephemeral-notification-key-not-real",
                 )
 
     def test_push_gateway_credential_is_shared_by_file_without_exposing_its_value(self) -> None:
         push_key = "ephemeral-push-key-not-real"
+        notification_key = "ephemeral-notification-key-not-real"
         with (
             mock.patch.object(operational_guest, "create_secret") as create_secret,
             mock.patch.object(operational_guest, "create_config"),
@@ -1180,6 +1184,7 @@ class OperationalContractTests(unittest.TestCase):
                 postgres_password="postgres-password",
                 openai_api_key="sk-ephemeral-test-key-not-real",
                 push_gateway_api_key=push_key,
+                push_notification_delivery_api_key=notification_key,
             )
             push_mounts, _ = operational_guest.materialize_mounts(
                 {"secrets": {}, "configs": {}},
@@ -1192,16 +1197,45 @@ class OperationalContractTests(unittest.TestCase):
                 postgres_password="postgres-password",
                 openai_api_key="sk-ephemeral-test-key-not-real",
                 push_gateway_api_key=push_key,
+                push_notification_delivery_api_key=notification_key,
+            )
+            notification_mounts, _ = operational_guest.materialize_mounts(
+                {"secrets": {}, "configs": {}},
+                {"secrets": [], "configs": []},
+                prefix="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="a" * 64,
+                deployment_id="jeeb-gh-1-1",
+                service_id="notification-service",
+                postgres_password="postgres-password",
+                openai_api_key="sk-ephemeral-test-key-not-real",
+                push_gateway_api_key=push_key,
+                push_notification_delivery_api_key=notification_key,
             )
 
-        self.assertEqual(2, create_secret.call_count)
-        for call in create_secret.call_args_list:
-            self.assertEqual("jeeb-eph-test-push-gateway-api-key", call.args[0])
-            self.assertEqual(push_key.encode(), call.args[1])
+        self.assertEqual(4, create_secret.call_count)
+        gateway_calls = [
+            call for call in create_secret.call_args_list
+            if call.args[0] == "jeeb-eph-test-push-gateway-api-key"
+        ]
+        notification_calls = [
+            call for call in create_secret.call_args_list
+            if call.args[0] == "jeeb-eph-test-push-notification-delivery-api-key"
+        ]
+        self.assertEqual(2, len(gateway_calls))
+        self.assertEqual(2, len(notification_calls))
+        self.assertTrue(all(call.args[1] == push_key.encode() for call in gateway_calls))
+        self.assertTrue(
+            all(call.args[1] == notification_key.encode() for call in notification_calls)
+        )
         self.assertEqual("65532", gateway_mounts[0]["uid"])
         self.assertEqual("10001", push_mounts[0]["uid"])
         self.assertEqual("push_gateway_api_key", gateway_mounts[0]["target"])
         self.assertEqual("push_gateway_api_key", push_mounts[0]["target"])
+        self.assertEqual("push_notification_delivery_api_key", push_mounts[1]["target"])
+        self.assertEqual(
+            "push_notification_delivery_api_key", notification_mounts[0]["target"]
+        )
 
         push_environment = operational_guest.transformed_environment(
             {"id": "push-notification"},
@@ -1216,6 +1250,28 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(
             "/run/secrets/push_gateway_api_key",
             push_environment["GATEWAY_API_KEY_FILE"],
+        )
+        self.assertEqual(
+            "/run/secrets/push_notification_delivery_api_key",
+            push_environment["NOTIFICATION_DELIVERY_API_KEY_FILE"],
+        )
+        self.assertEqual("strict", push_environment["PUSH_AUTH_MODE"])
+        self.assertEqual("true", push_environment["PUSH_PIPELINE_REQUIRED"])
+
+        notification_environment = operational_guest.transformed_environment(
+            {"id": "notification-service"},
+            {"env": []},
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-test.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+        self.assertEqual("X-Api-Key", notification_environment["WEBHOOK_AUTH_HEADER_NAME"])
+        self.assertEqual(
+            "/run/secrets/push_notification_delivery_api_key",
+            notification_environment["WEBHOOK_AUTH_HEADER_VALUE_FILE"],
         )
 
     def test_voice_environment_and_secret_are_real_provider_file_backed(self) -> None:
@@ -1261,6 +1317,7 @@ class OperationalContractTests(unittest.TestCase):
                 postgres_password="postgres-password",
                 openai_api_key="sk-ephemeral-test-key-not-real",
                 push_gateway_api_key="ephemeral-push-key-not-real",
+                push_notification_delivery_api_key="ephemeral-notification-key-not-real",
             )
         create_secret.assert_called_once()
         self.assertEqual("openai-ephemeral-sandbox-api-key", mounts[0]["target"])
