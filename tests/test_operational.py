@@ -353,6 +353,53 @@ class OperationalContractTests(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=yes", options)
         self.assertIn("HostKeyAlgorithms=ssh-ed25519", options)
 
+    def test_digest_pinned_pull_retries_transient_registry_resets(self) -> None:
+        image = "ghcr.io/olivium-dev/test@sha256:" + "a" * 64
+        reset = SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=b"failed to do request: read: connection reset by peer",
+        )
+        success = SimpleNamespace(returncode=0, stdout=b"pulled", stderr=b"")
+
+        with (
+            mock.patch.object(
+                operational_guest,
+                "docker",
+                side_effect=[reset, reset, success],
+            ) as docker,
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+        ):
+            operational_guest.pull_image(image)
+
+        self.assertEqual(3, docker.call_count)
+        docker.assert_called_with(
+            "pull",
+            image,
+            timeout=1800,
+            capture=True,
+            check=False,
+        )
+        self.assertEqual([mock.call(5), mock.call(15)], sleep.call_args_list)
+
+    def test_digest_pinned_pull_fails_fast_for_registry_auth_errors(self) -> None:
+        image = "ghcr.io/olivium-dev/test@sha256:" + "b" * 64
+        denied = SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=b"unauthorized: authentication required",
+        )
+
+        with (
+            mock.patch.object(operational_guest, "docker", return_value=denied) as docker,
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+            self.assertRaisesRegex(operational_guest.DeployError, "non-retryable error"),
+        ):
+            operational_guest.pull_image(image)
+
+        docker.assert_called_once()
+        sleep.assert_not_called()
+
     def test_coroot_agent_is_pinned_privileged_private_and_secret_file_backed(self) -> None:
         api_key = "coroot-ephemeral-test-key-not-real"
         completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")

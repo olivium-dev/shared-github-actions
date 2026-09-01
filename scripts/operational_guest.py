@@ -54,6 +54,17 @@ COROOT_NODE_AGENT_IMAGE = (
 )
 COROOT_COLLECTOR_ENDPOINT = "https://coroot-staging.fds-3.space"
 COROOT_CONTAINER_NAME = "coroot-ephemeral-node-agent"
+PULL_RETRY_DELAYS = (5, 15)
+TRANSIENT_PULL_ERRORS = (
+    "connection reset by peer",
+    "unexpected eof",
+    "tls handshake timeout",
+    "i/o timeout",
+    "context deadline exceeded",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "failed to do request",
+)
 LEGACY_FAKE_VOICE_COMMIT = "8f76393982e224306a30a067636109d3573f2f8b"
 POSTGRES_DATABASES = {
     "jeeb-state-service": "jeeb_state_staging",
@@ -168,6 +179,37 @@ def run(
 
 def docker(*arguments: str, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
     return run(["docker", *arguments], **kwargs)
+
+
+def pull_image(image: str) -> None:
+    require(
+        "@sha256:" in image and len(image.rsplit("@sha256:", 1)[1]) == 64,
+        "docker pulls must use an immutable digest",
+    )
+    attempts = len(PULL_RETRY_DELAYS) + 1
+    for attempt in range(attempts):
+        result = docker("pull", image, timeout=1800, capture=True, check=False)
+        if result.returncode == 0:
+            return
+
+        detail = ((result.stderr or b"") + (result.stdout or b"")).decode(
+            errors="replace"
+        ).lower()
+        transient = any(marker in detail for marker in TRANSIENT_PULL_ERRORS)
+        if not transient or attempt == attempts - 1:
+            failure_type = "transient network error" if transient else "non-retryable error"
+            raise DeployError(
+                f"docker pull failed after {attempt + 1} attempt(s) for immutable image "
+                f"({failure_type})"
+            )
+
+        delay = PULL_RETRY_DELAYS[attempt]
+        print(
+            f"docker pull hit a transient network error; retrying in {delay}s "
+            f"(attempt {attempt + 2}/{attempts})",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
 
 
 def bounded_command_output(
@@ -751,7 +793,7 @@ def deploy_coroot_node_agent(
 
     volume = f"jeeb-eph-{lease_id}-coroot-agent-data"
     ensure_volume(volume, lease_id, lock_hash, deployment_id)
-    docker("pull", COROOT_NODE_AGENT_IMAGE, timeout=1800)
+    pull_image(COROOT_NODE_AGENT_IMAGE)
     entrypoint = (
         'api_key="$(cat /run/secrets/coroot-api-key)"; '
         'test -n "$api_key"; export API_KEY="$api_key"; unset api_key; '
@@ -815,7 +857,7 @@ def create_infrastructure(
 ) -> None:
     images = {item["id"]: item["image"] for item in config["infrastructure"]}
     for component in ("postgresql", "mongodb", "redis", "lease-local-registry"):
-        docker("pull", images[component], timeout=1800)
+        pull_image(images[component])
 
     postgres_volume = f"{prefix}-postgresql-data"
     mongo_volume = f"{prefix}-mongodb-data"
@@ -1628,7 +1670,7 @@ def deploy(args: argparse.Namespace) -> None:
     ordered.append(next(item for item in config["services"] if item["id"] == "jeeb-gateway"))
     for service in ordered:
         require(service["stagingName"] in template_by_name, f"template is missing {service['id']}")
-        docker("pull", service["image"], timeout=1800)
+        pull_image(service["image"])
         create_application(
             service,
             template,
@@ -1649,7 +1691,7 @@ def deploy(args: argparse.Namespace) -> None:
         )
 
     web_application = config["webApplications"][0]
-    docker("pull", web_application["image"], timeout=1800)
+    pull_image(web_application["image"])
     create_web_application(
         web_application,
         prefix=prefix,
