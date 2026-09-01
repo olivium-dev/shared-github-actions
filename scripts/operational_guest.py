@@ -1287,7 +1287,7 @@ def configure_public_gateway(config_path: Path = Path("/etc/nginx/sites-availabl
         proxy_set_header X-Forwarded-Proto https;
     }
 
-    location ~ ^/(?:api|v1|admin|health)(?:/|$) {
+    location ~ ^/(?:api|v1|admin|health|transcribe)(?:/|$) {
         proxy_pass http://127.0.0.1:10000;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
