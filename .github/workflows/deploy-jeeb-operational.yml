@@ -31,7 +31,7 @@ on:
       super_login_passcode:
         required: true
       openai_api_key:
-        required: true
+        required: false
       coroot_api_key:
         required: true
     outputs:

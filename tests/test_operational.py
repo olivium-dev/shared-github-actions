@@ -142,7 +142,7 @@ class OperationalContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("super_login_passcode:\n        required: true", workflow)
-        self.assertIn("openai_api_key:\n        required: true", workflow)
+        self.assertIn("openai_api_key:\n        required: false", workflow)
         self.assertIn("coroot_api_key:\n        required: true", workflow)
         self.assertIn(
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}",
@@ -180,6 +180,10 @@ class OperationalContractTests(unittest.TestCase):
         with mock.patch.dict(os.environ, invalid, clear=True):
             with self.assertRaisesRegex(operational_orchestrate.ContractError, "passcode is unavailable"):
                 operational_orchestrate.protected_deployment_credentials()
+
+        legacy = {**valid, "JEEB_EPHEMERAL_OPENAI_API_KEY": ""}
+        with mock.patch.dict(os.environ, legacy, clear=True):
+            self.assertEqual("", operational_orchestrate.protected_deployment_credentials()[3])
 
     def test_manager_get_retries_a_transient_read_timeout(self) -> None:
         client = manager_client.ManagerClient(
@@ -812,6 +816,7 @@ class OperationalContractTests(unittest.TestCase):
             public_hostname="eph-test.fds-8.space",
             private_ip="192.168.2.160",
             gateway_routes=[],
+            openai_api_key="sk-ephemeral-test-key-not-real",
         )
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertEqual("production", environment["ENVIRONMENT"])
@@ -842,6 +847,20 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual("65532", mounts[0]["gid"])
         self.assertEqual(0o400, mounts[0]["mode"])
 
+        fake_environment = operational_guest.transformed_environment(
+            service,
+            template_service,
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-test.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+        self.assertEqual("1", fake_environment["WHISPER_FAKE_TRANSCRIBE"])
+        self.assertNotIn("OPENAI_API_KEY", fake_environment)
+        self.assertNotIn("OPENAI_API_KEY_FILE", fake_environment)
+
     def test_guest_config_requires_exactly_the_catalog_services(self) -> None:
         config = operational_config()
         config["apiVersion"] = "olivium.dev/jeeb-operational-ephemeral/v1"
@@ -852,6 +871,20 @@ class OperationalContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(operational_guest.DeployError, "exactly 24"):
             operational_guest.validate_config(config, catalog)
+
+    def test_only_the_exact_legacy_voice_revision_may_run_without_openai(self) -> None:
+        config = operational_config()
+        voice = next(item for item in config["services"] if item["id"] == "voice-transcription-service")
+        voice["commit"] = operational_guest.LEGACY_FAKE_VOICE_COMMIT
+        self.assertEqual("", operational_guest.validate_openai_credential(config, ""))
+
+        voice["commit"] = "ac8943b5be33ae65ad44263b803d486bb09c5f9e"
+        with self.assertRaisesRegex(operational_guest.DeployError, "non-legacy voice"):
+            operational_guest.validate_openai_credential(config, "")
+        self.assertEqual(
+            "sk-ephemeral-test-key-not-real",
+            operational_guest.validate_openai_credential(config, "sk-ephemeral-test-key-not-real"),
+        )
 
 
 if __name__ == "__main__":

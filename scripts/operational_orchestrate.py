@@ -111,13 +111,14 @@ def protected_deployment_credentials() -> tuple[str, str, str, str, str]:
         and super_login_passcode.isprintable(),
         "protected ephemeral super-login passcode is unavailable",
     )
-    require(
-        20 <= len(openai_api_key) <= 4096
-        and openai_api_key == openai_api_key.strip()
-        and openai_api_key.isprintable()
-        and not any(character.isspace() for character in openai_api_key),
-        "protected ephemeral OpenAI credential is unavailable",
-    )
+    if openai_api_key:
+        require(
+            20 <= len(openai_api_key) <= 4096
+            and openai_api_key == openai_api_key.strip()
+            and openai_api_key.isprintable()
+            and not any(character.isspace() for character in openai_api_key),
+            "protected ephemeral OpenAI credential is invalid",
+        )
     require(
         20 <= len(coroot_api_key) <= 4096
         and coroot_api_key == coroot_api_key.strip()

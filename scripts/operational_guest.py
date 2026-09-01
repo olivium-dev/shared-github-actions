@@ -53,6 +53,7 @@ COROOT_NODE_AGENT_IMAGE = (
 )
 COROOT_COLLECTOR_ENDPOINT = "https://coroot-staging.fds-3.space"
 COROOT_CONTAINER_NAME = "coroot-ephemeral-node-agent"
+LEGACY_FAKE_VOICE_COMMIT = "8f76393982e224306a30a067636109d3573f2f8b"
 POSTGRES_DATABASES = {
     "jeeb-state-service": "jeeb_state_staging",
     "user-management": "jeeb-user-management_staging",
@@ -393,6 +394,7 @@ def transformed_environment(
     public_hostname: str,
     private_ip: str,
     gateway_routes: list[dict[str, Any]],
+    openai_api_key: str = "",
 ) -> dict[str, str]:
     service_id = service["id"]
     environment: dict[str, str] = {}
@@ -464,9 +466,13 @@ def transformed_environment(
 
     if service_id == "voice-transcription-service":
         environment.pop("OPENAI_API_KEY", None)
-        environment["ENVIRONMENT"] = "production"
-        environment["OPENAI_API_KEY_FILE"] = "/run/secrets/openai-ephemeral-sandbox-api-key"
-        environment["WHISPER_FAKE_TRANSCRIBE"] = "0"
+        if openai_api_key:
+            environment["ENVIRONMENT"] = "production"
+            environment["OPENAI_API_KEY_FILE"] = "/run/secrets/openai-ephemeral-sandbox-api-key"
+            environment["WHISPER_FAKE_TRANSCRIBE"] = "0"
+        else:
+            environment.pop("OPENAI_API_KEY_FILE", None)
+            environment["WHISPER_FAKE_TRANSCRIBE"] = "1"
 
     if service_id == "realtime-comunication-service":
         environment["PHX_HOST"] = public_hostname
@@ -1160,8 +1166,7 @@ def materialize_mounts(
             }
         )
 
-    if service_id == "voice-transcription-service":
-        require(openai_api_key, "ephemeral OpenAI credential is unavailable")
+    if service_id == "voice-transcription-service" and openai_api_key:
         name = f"{prefix}-voice-transcription-service-openai"
         create_secret(name, openai_api_key.encode(), lease_id, lock_hash, deployment_id)
         secret_mounts.append(
@@ -1226,6 +1231,7 @@ def create_application(
         public_hostname=public_hostname,
         private_ip=private_ip,
         gateway_routes=catalog["gatewayRouting"],
+        openai_api_key=openai_api_key,
     )
     secret_mounts, config_mounts = materialize_mounts(
         template,
@@ -1372,6 +1378,24 @@ def validate_config(config: dict[str, Any], catalog: dict[str, Any]) -> None:
         raise DeployError(str(exc)) from exc
 
 
+def validate_openai_credential(config: dict[str, Any], openai_api_key: Any) -> str:
+    require(isinstance(openai_api_key, str), "ephemeral OpenAI credential is invalid")
+    if openai_api_key:
+        require(
+            20 <= len(openai_api_key) <= 4096
+            and openai_api_key == openai_api_key.strip()
+            and openai_api_key.isprintable()
+            and not any(character.isspace() for character in openai_api_key),
+            "ephemeral OpenAI credential is invalid",
+        )
+    voice_service = next(item for item in config["services"] if item["id"] == "voice-transcription-service")
+    require(
+        bool(openai_api_key) or voice_service["commit"] == LEGACY_FAKE_VOICE_COMMIT,
+        "non-legacy voice deployment requires the protected OpenAI credential",
+    )
+    return openai_api_key
+
+
 def deploy(args: argparse.Namespace) -> None:
     require(os.geteuid() == 0, "guest deployment must run as root")
     config = load_json(args.config)
@@ -1444,14 +1468,7 @@ def deploy(args: argparse.Namespace) -> None:
         and super_login_passcode.isprintable(),
         "ephemeral super-login passcode missing",
     )
-    require(
-        isinstance(openai_api_key, str)
-        and 20 <= len(openai_api_key) <= 4096
-        and openai_api_key == openai_api_key.strip()
-        and openai_api_key.isprintable()
-        and not any(character.isspace() for character in openai_api_key),
-        "ephemeral OpenAI credential missing",
-    )
+    openai_api_key = validate_openai_credential(config, openai_api_key)
     require(
         isinstance(coroot_api_key, str)
         and 20 <= len(coroot_api_key) <= 4096
