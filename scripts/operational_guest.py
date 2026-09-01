@@ -581,6 +581,9 @@ def transformed_environment(
             environment.pop("OPENAI_API_KEY_FILE", None)
             environment["WHISPER_FAKE_TRANSCRIBE"] = "1"
 
+    if service_id == "push-notification":
+        environment["GATEWAY_API_KEY_FILE"] = "/run/secrets/push_gateway_api_key"
+
     if service_id == "realtime-comunication-service":
         environment["PHX_HOST"] = public_hostname
 
@@ -599,6 +602,13 @@ def transformed_environment(
         environment["FORCE_EXPIRE_SEAM_ENABLED"] = "false"
 
     if service_id == "jeeb-gateway":
+        environment["ASPNETCORE_ENVIRONMENT"] = "Ephemeral"
+        environment["DOTNET_ENVIRONMENT"] = "Ephemeral"
+        environment["Features__RealtimeWebSocketProxy__Enabled"] = "false"
+        environment["FeatureFlags__NotificationDurableWrite__Enabled"] = "true"
+        environment["PushNotificationServiceApi__GatewayApiKeyFile"] = (
+            "/run/secrets/push_gateway_api_key"
+        )
         environment["Gateway__PublicBaseUrl"] = f"https://{public_hostname}"
         environment["Jwt__Issuer"] = f"https://{public_hostname}"
         environment["AdminPortal__AllowedOrigins__0"] = f"https://{public_hostname}"
@@ -1299,6 +1309,7 @@ def materialize_mounts(
     service_id: str,
     postgres_password: str,
     openai_api_key: str,
+    push_gateway_api_key: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     secret_mounts: list[dict[str, Any]] = []
     for index, mount in enumerate(template_service.get("secrets", [])):
@@ -1330,6 +1341,27 @@ def materialize_mounts(
                 "target": "openai-ephemeral-sandbox-api-key",
                 "uid": "65532",
                 "gid": "65532",
+                "mode": 0o400,
+            }
+        )
+
+    if service_id in {"jeeb-gateway", "push-notification"}:
+        require(push_gateway_api_key, "ephemeral push gateway API key is unavailable")
+        name = f"{prefix}-push-gateway-api-key"
+        create_secret(
+            name,
+            push_gateway_api_key.encode(),
+            lease_id,
+            lock_hash,
+            deployment_id,
+        )
+        uid = "65532" if service_id == "jeeb-gateway" else "10001"
+        secret_mounts.append(
+            {
+                "name": name,
+                "target": "push_gateway_api_key",
+                "uid": uid,
+                "gid": uid,
                 "mode": 0o400,
             }
         )
@@ -1370,6 +1402,7 @@ def create_application(
     mongo_password: str,
     super_login_passcode: str,
     openai_api_key: str,
+    push_gateway_api_key: str,
     public_hostname: str,
     private_ip: str,
     probe_config: str,
@@ -1398,6 +1431,7 @@ def create_application(
         service_id=service_id,
         postgres_password=postgres_password,
         openai_api_key=openai_api_key,
+        push_gateway_api_key=push_gateway_api_key,
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="jeeb-env-", delete=False) as handle:
         for key, value in sorted(environment.items()):
@@ -1650,6 +1684,7 @@ def deploy(args: argparse.Namespace) -> None:
 
     postgres_password = secrets.token_urlsafe(32)
     mongo_password = secrets.token_urlsafe(32)
+    push_gateway_api_key = secrets.token_urlsafe(48)
     ensure_network(network, args.lease_id, lock_hash, args.deployment_id)
     create_infrastructure(
         config,
@@ -1692,6 +1727,7 @@ def deploy(args: argparse.Namespace) -> None:
             mongo_password=mongo_password,
             super_login_passcode=super_login_passcode,
             openai_api_key=openai_api_key,
+            push_gateway_api_key=push_gateway_api_key,
             public_hostname=public_hostname,
             private_ip=str(private_ip),
             probe_config=probe_config,
