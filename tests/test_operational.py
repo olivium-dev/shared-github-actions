@@ -723,6 +723,37 @@ class OperationalContractTests(unittest.TestCase):
             result["CaseManagement__GatewayCallbackUrl"],
         )
 
+    def test_forbidden_ip_matching_does_not_reject_a_longer_lease_address(self) -> None:
+        for forbidden in ("192.168.2.20", "192.168.2.39", "192.168.2.50"):
+            with self.subTest(forbidden=forbidden):
+                self.assertTrue(
+                    operational_guest.contains_forbidden_endpoint(
+                        f"UPSTREAM=http://{forbidden}:8080/health",
+                        forbidden,
+                    )
+                )
+        self.assertFalse(
+            operational_guest.contains_forbidden_endpoint(
+                "CaseManagement__GatewayCallbackUrl=http://192.168.2.200:10000/callback",
+                "192.168.2.20",
+            )
+        )
+
+        result = operational_guest.transformed_environment(
+            {"id": "jeeb-state-service"},
+            {"env": ["CaseManagement__GatewayCallbackUrl=http://192.168.2.20:10000/old"]},
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-bright-pikachu-42.fds-8.space",
+            private_ip="192.168.2.200",
+            gateway_routes=[],
+        )
+        self.assertEqual(
+            "http://192.168.2.200:10000/internal/case-management/callback",
+            result["CaseManagement__GatewayCallbackUrl"],
+        )
+
     def test_generic_postgres_url_disables_ssl_inside_the_lease(self) -> None:
         result = operational_guest.transformed_environment(
             {"id": "delivery-service"},
