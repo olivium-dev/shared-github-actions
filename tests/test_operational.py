@@ -303,8 +303,13 @@ class OperationalContractTests(unittest.TestCase):
                 elif command.startswith("sha256sum -- "):
                     path = command.removeprefix("sha256sum -- ")
                     return hashlib.sha256(uploaded[path]).hexdigest() + "  " + path
-                elif command.startswith("sudo python3 "):
+                elif "guest-credentials.json" in command and command.startswith("sudo /bin/bash -c "):
                     guest_credentials.update(json.loads(stdin or b"{}"))
+                elif command.startswith("sudo systemd-run --quiet "):
+                    self.assertIsNone(stdin)
+                elif command.startswith("if sudo test -s "):
+                    return "0"
+                elif command.endswith("/guest-output.log"):
                     return '{"ok":true}'
                 return ""
 
@@ -342,6 +347,83 @@ class OperationalContractTests(unittest.TestCase):
             self.assertEqual("ephemeral-only-passcode", guest_credentials["superLoginPasscode"])
             self.assertEqual("sk-ephemeral-test-key-not-real", guest_credentials["openAiApiKey"])
             self.assertEqual("coroot-ephemeral-test-key-not-real", guest_credentials["corootApiKey"])
+            rendered_commands = json.dumps(commands)
+            self.assertIn("sudo systemd-run --quiet", rendered_commands)
+            self.assertNotIn("token-that-is-long-enough", rendered_commands)
+            self.assertNotIn("sk-ephemeral-test-key-not-real", rendered_commands)
+
+    def test_heartbeat_reconciles_a_transient_progress_failure(self) -> None:
+        lease = {
+            "leaseId": "solar-piplup-26",
+            "deploymentId": "jeeb-gh-1-1",
+            "deploymentLockHash": "a" * 64,
+            "state": "deploying",
+            "stateVersion": 4,
+        }
+        refreshed = {**lease, "stateVersion": 5}
+        client = mock.Mock()
+        client.progress.side_effect = (operational_orchestrate.ContractError("transient"), refreshed)
+        client.lease.return_value = lease
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        with mock.patch.object(operational_orchestrate.time, "sleep"):
+            result = heartbeat.transition("deploying")
+
+        self.assertEqual(5, result["stateVersion"])
+        self.assertEqual(2, client.progress.call_count)
+
+    def test_heartbeat_accepts_a_progress_response_lost_after_commit(self) -> None:
+        lease = {
+            "leaseId": "solar-piplup-26",
+            "deploymentId": "jeeb-gh-1-1",
+            "deploymentLockHash": "a" * 64,
+            "state": "deploying",
+            "stateVersion": 4,
+        }
+        refreshed = {**lease, "stateVersion": 5}
+        client = mock.Mock()
+        client.progress.side_effect = operational_orchestrate.ContractError("response lost")
+        client.lease.return_value = refreshed
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        result = heartbeat.transition("deploying")
+
+        self.assertEqual(5, result["stateVersion"])
+        client.progress.assert_called_once()
+
+    def test_detached_guest_deploy_survives_a_transient_poll_disconnect(self) -> None:
+        poll_attempts = 0
+
+        def fake_transport(argv: list[str], *, stdin: bytes | None = None, timeout: int = 1800) -> str:
+            nonlocal poll_attempts
+            del stdin, timeout
+            command = argv[-1]
+            if command.startswith("if sudo test -s "):
+                poll_attempts += 1
+                if poll_attempts == 1:
+                    raise operational_orchestrate.ContractError(
+                        "Cloudflare SSH operation failed (255): Broken pipe"
+                    )
+                return "running" if poll_attempts == 2 else "0"
+            if command.endswith("/guest-output.log"):
+                return '{"ok":true}'
+            return ""
+
+        with (
+            mock.patch.object(operational_orchestrate, "transport", side_effect=fake_transport),
+            mock.patch.object(operational_orchestrate.time, "sleep"),
+        ):
+            output = operational_orchestrate.detached_guest_deploy(
+                destination="ec2-user@ssh-eph-solar-piplup-26.fds-8.space",
+                options=["-o", "BatchMode=yes"],
+                remote_root="/tmp/jeeb-operational-solar-piplup-26",
+                lease_id="solar-piplup-26",
+                command="sudo python3 /tmp/guest.py",
+                credentials=b'{"secret":"not-logged"}',
+            )
+
+        self.assertEqual('{"ok":true}', output)
+        self.assertEqual(3, poll_attempts)
 
     def test_cloudflare_ssh_keeps_long_guest_deployments_alive(self) -> None:
         options = operational_orchestrate.ssh_options(
