@@ -647,6 +647,14 @@ def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
         serialized = json.dumps(row, sort_keys=True)
         require(api_key not in serialized, "Coroot API key leaked into Docker metadata")
         require(row["Config"]["Image"] == COROOT_NODE_AGENT_IMAGE, "Coroot agent image is not pinned")
+        command = row["Config"].get("Cmd")
+        require(isinstance(command, list), "Coroot agent command metadata is invalid")
+        command_text = "\n".join(str(part) for part in command)
+        require(
+            'export API_KEY="$api_key"' in command_text
+            and "COROOT_API_KEY" not in command_text,
+            "Coroot agent does not use the documented Linux API key environment",
+        )
         require(row["HostConfig"]["Privileged"] is True, "Coroot agent is not privileged")
         require(row["HostConfig"]["PidMode"] == "host", "Coroot agent cannot see host processes")
         require(not row["HostConfig"].get("PortBindings"), "Coroot agent publishes a host port")
@@ -734,7 +742,7 @@ def deploy_coroot_node_agent(
     docker("pull", COROOT_NODE_AGENT_IMAGE, timeout=1800)
     entrypoint = (
         'api_key="$(cat /run/secrets/coroot-api-key)"; '
-        'test -n "$api_key"; export COROOT_API_KEY="$api_key"; unset api_key; '
+        'test -n "$api_key"; export API_KEY="$api_key"; unset api_key; '
         "exec /usr/bin/coroot-node-agent "
         '--collector-endpoint="$COROOT_COLLECTOR_ENDPOINT" '
         "--cgroupfs-root=/host/sys/fs/cgroup --wal-dir=/data"
