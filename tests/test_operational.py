@@ -833,6 +833,14 @@ class OperationalContractTests(unittest.TestCase):
         self.assertIn("eph-bright-pikachu-42.fds-8.space", serialized)
         for forbidden in operational_guest.FORBIDDEN:
             self.assertNotIn(forbidden, serialized)
+        self.assertEqual("Ephemeral", result["ASPNETCORE_ENVIRONMENT"])
+        self.assertEqual("Ephemeral", result["DOTNET_ENVIRONMENT"])
+        self.assertEqual("false", result["Features__RealtimeWebSocketProxy__Enabled"])
+        self.assertEqual("true", result["FeatureFlags__NotificationDurableWrite__Enabled"])
+        self.assertEqual(
+            "/run/secrets/push_gateway_api_key",
+            result["PushNotificationServiceApi__GatewayApiKeyFile"],
+        )
 
     def test_state_callback_uses_the_lease_private_ip(self) -> None:
         result = operational_guest.transformed_environment(
@@ -978,6 +986,7 @@ class OperationalContractTests(unittest.TestCase):
                 mongo_password="mongo-password",
                 super_login_passcode="ephemeral-only-passcode",
                 openai_api_key="sk-ephemeral-test-key-not-real",
+                push_gateway_api_key="ephemeral-push-key-not-real",
                 public_hostname="eph-bright-pikachu-42.fds-8.space",
                 private_ip="192.168.2.160",
                 probe_config="jeeb-eph-test-http-health-probe",
@@ -1112,6 +1121,7 @@ class OperationalContractTests(unittest.TestCase):
                 service_id="jeeb-state-service",
                 postgres_password="postgres-password",
                 openai_api_key="sk-ephemeral-test-key-not-real",
+                push_gateway_api_key="ephemeral-push-key-not-real",
             )
 
         self.assertEqual("64198", secrets[0]["uid"])
@@ -1150,7 +1160,63 @@ class OperationalContractTests(unittest.TestCase):
                     service_id="jeeb-state-service",
                     postgres_password="postgres-password",
                     openai_api_key="sk-ephemeral-test-key-not-real",
+                    push_gateway_api_key="ephemeral-push-key-not-real",
                 )
+
+    def test_push_gateway_credential_is_shared_by_file_without_exposing_its_value(self) -> None:
+        push_key = "ephemeral-push-key-not-real"
+        with (
+            mock.patch.object(operational_guest, "create_secret") as create_secret,
+            mock.patch.object(operational_guest, "create_config"),
+        ):
+            gateway_mounts, _ = operational_guest.materialize_mounts(
+                {"secrets": {}, "configs": {}},
+                {"secrets": [], "configs": []},
+                prefix="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="a" * 64,
+                deployment_id="jeeb-gh-1-1",
+                service_id="jeeb-gateway",
+                postgres_password="postgres-password",
+                openai_api_key="sk-ephemeral-test-key-not-real",
+                push_gateway_api_key=push_key,
+            )
+            push_mounts, _ = operational_guest.materialize_mounts(
+                {"secrets": {}, "configs": {}},
+                {"secrets": [], "configs": []},
+                prefix="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="a" * 64,
+                deployment_id="jeeb-gh-1-1",
+                service_id="push-notification",
+                postgres_password="postgres-password",
+                openai_api_key="sk-ephemeral-test-key-not-real",
+                push_gateway_api_key=push_key,
+            )
+
+        self.assertEqual(2, create_secret.call_count)
+        for call in create_secret.call_args_list:
+            self.assertEqual("jeeb-eph-test-push-gateway-api-key", call.args[0])
+            self.assertEqual(push_key.encode(), call.args[1])
+        self.assertEqual("65532", gateway_mounts[0]["uid"])
+        self.assertEqual("10001", push_mounts[0]["uid"])
+        self.assertEqual("push_gateway_api_key", gateway_mounts[0]["target"])
+        self.assertEqual("push_gateway_api_key", push_mounts[0]["target"])
+
+        push_environment = operational_guest.transformed_environment(
+            {"id": "push-notification"},
+            {"env": []},
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-test.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+        self.assertEqual(
+            "/run/secrets/push_gateway_api_key",
+            push_environment["GATEWAY_API_KEY_FILE"],
+        )
 
     def test_voice_environment_and_secret_are_real_provider_file_backed(self) -> None:
         service = {"id": "voice-transcription-service"}
@@ -1194,6 +1260,7 @@ class OperationalContractTests(unittest.TestCase):
                 service_id="voice-transcription-service",
                 postgres_password="postgres-password",
                 openai_api_key="sk-ephemeral-test-key-not-real",
+                push_gateway_api_key="ephemeral-push-key-not-real",
             )
         create_secret.assert_called_once()
         self.assertEqual("openai-ephemeral-sandbox-api-key", mounts[0]["target"])
