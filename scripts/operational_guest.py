@@ -7,11 +7,11 @@ import argparse
 import base64
 import gzip
 import hashlib
-import ipaddress
 import json
 import os
 import re
 import secrets
+import select
 import socket
 import stat
 import subprocess
@@ -138,7 +138,7 @@ def run(
     argv: list[str],
     *,
     stdin: bytes | None = None,
-    timeout: int = 1200,
+    timeout: float = 1200,
     capture: bool = False,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -158,6 +158,54 @@ def run(
 
 def docker(*arguments: str, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
     return run(["docker", *arguments], **kwargs)
+
+
+def bounded_command_output(
+    argv: list[str],
+    *,
+    output_limit: int,
+    timeout: float,
+) -> subprocess.CompletedProcess[bytes]:
+    require(output_limit > 0 and timeout > 0, "bounded command limits are invalid")
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    require(process.stdout is not None, "bounded command output is unavailable")
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while len(output) <= output_limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
+            if not readable:
+                break
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(64 * 1024, output_limit + 1 - len(output)),
+            )
+            if not chunk:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        pass
+                break
+            output.extend(chunk)
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+    return subprocess.CompletedProcess(argv, process.returncode, bytes(output), b"")
 
 
 def decode_chunked_http(body: bytes) -> bytes:
@@ -565,52 +613,29 @@ def write_restricted_secret(path: Path, value: str) -> None:
         raise
 
 
-def coroot_agent_address(inspect_row: dict[str, Any]) -> str:
-    network_settings = inspect_row.get("NetworkSettings")
-    require(isinstance(network_settings, dict), "Coroot agent network inspection is unavailable")
-
-    networks = network_settings.get("Networks")
-    bridge = networks.get("bridge") if isinstance(networks, dict) else None
-    if isinstance(bridge, dict):
-        address = bridge.get("IPAddress")
-        if isinstance(address, str) and address:
-            return validated_coroot_agent_address(address)
-
-    legacy = network_settings.get("IPAddress")
-    if isinstance(legacy, str) and legacy:
-        return validated_coroot_agent_address(legacy)
-
-    require(isinstance(networks, dict), "Coroot agent network inspection is unavailable")
-    addresses = {
-        details.get("IPAddress")
-        for details in networks.values()
-        if isinstance(details, dict)
-        and isinstance(details.get("IPAddress"), str)
-        and details.get("IPAddress")
-    }
-    require(len(addresses) == 1, "Coroot agent has no unambiguous private container address")
-    return validated_coroot_agent_address(addresses.pop())
-
-
-def validated_coroot_agent_address(value: str) -> str:
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError as exc:
-        raise DeployError("Coroot agent private container address is invalid") from exc
-    require(
-        address.version == 4 and address.is_private,
-        "Coroot agent private container address must be private IPv4",
-    )
-    return str(address)
-
-
 def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
     deadline = time.monotonic() + timeout
     last = "container has not started"
-    while time.monotonic() < deadline:
-        inspected = docker("container", "inspect", COROOT_CONTAINER_NAME, capture=True, check=False)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            inspected = docker(
+                "container",
+                "inspect",
+                COROOT_CONTAINER_NAME,
+                capture=True,
+                check=False,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            last = "container inspection timed out"
+            continue
         if inspected.returncode != 0:
-            time.sleep(3)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(3, remaining))
             continue
         try:
             rows = json.loads(inspected.stdout)
@@ -626,17 +651,39 @@ def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
         require(not row["HostConfig"].get("PortBindings"), "Coroot agent publishes a host port")
         if row["State"]["Running"] is not True:
             last = row["State"].get("Status", "not running")
-            time.sleep(3)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(3, remaining))
             continue
-        address = coroot_agent_address(row)
-        try:
-            with urllib.request.urlopen(f"http://{address}:80/metrics", timeout=5) as response:
-                metrics = response.read(2_000_000)
-            require(b"node_agent_info" in metrics, "Coroot agent metrics are unavailable")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        probe = bounded_command_output(
+            [
+                "docker",
+                "exec",
+                COROOT_CONTAINER_NAME,
+                "/usr/bin/curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "5",
+                "http://127.0.0.1:10300/metrics",
+            ],
+            output_limit=2_000_000,
+            timeout=min(10, remaining),
+        )
+        if (
+            probe.returncode == 0
+            and len(probe.stdout) <= 2_000_000
+            and b"node_agent_info" in probe.stdout
+        ):
             return
-        except (urllib.error.URLError, TimeoutError, DeployError) as exc:
-            last = str(exc)
-            time.sleep(3)
+        last = "namespace-local metrics endpoint is unavailable"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(3, remaining))
     raise DeployError(f"Coroot node agent did not become ready: {last}")
 
 

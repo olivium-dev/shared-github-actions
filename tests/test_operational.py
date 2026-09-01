@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -355,6 +356,11 @@ class OperationalContractTests(unittest.TestCase):
             state_dir = Path(temporary_name)
             with (
                 mock.patch.object(operational_guest, "docker", side_effect=fake_docker),
+                mock.patch.object(
+                    operational_guest,
+                    "bounded_command_output",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"node_agent_info 1\n"),
+                ) as bounded_output,
                 mock.patch.object(operational_guest.urllib.request, "urlopen") as urlopen,
             ):
                 urlopen.return_value.__enter__.return_value.status = 200
@@ -380,70 +386,144 @@ class OperationalContractTests(unittest.TestCase):
         self.assertNotIn(api_key, serialized)
         self.assertNotIn("--publish", run_call)
         self.assertIn("/run/secrets/coroot-api-key", serialized)
+        exec_call = bounded_output.call_args.args[0]
+        self.assertEqual(["docker", "exec", operational_guest.COROOT_CONTAINER_NAME], exec_call[:3])
+        self.assertIn("/usr/bin/curl", exec_call)
+        self.assertIn("http://127.0.0.1:10300/metrics", exec_call)
+        self.assertNotIn("172.17.0.2", " ".join(exec_call))
+        self.assertEqual(2_000_000, bounded_output.call_args.kwargs["output_limit"])
+        self.assertEqual(10, bounded_output.call_args.kwargs["timeout"])
+        self.assertEqual(2, urlopen.call_count)
 
-    def test_coroot_agent_address_supports_modern_and_legacy_inspect_shapes(self) -> None:
-        self.assertEqual(
-            "172.17.0.2",
-            operational_guest.coroot_agent_address(
-                {"NetworkSettings": {"IPAddress": "172.17.0.2"}}
-            ),
+    def test_bounded_command_output_caps_output_and_enforces_timeout(self) -> None:
+        oversized = operational_guest.bounded_command_output(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 4096)"],
+            output_limit=64,
+            timeout=2,
         )
-        self.assertEqual(
-            "172.17.0.3",
-            operational_guest.coroot_agent_address(
-                {
-                    "NetworkSettings": {
-                        "IPAddress": "172.17.0.99",
-                        "Networks": {
-                            "bridge": {"IPAddress": "172.17.0.3"},
-                            "secondary": {"IPAddress": "172.18.0.3"},
-                        }
-                    }
-                }
-            ),
-        )
-        self.assertEqual(
-            "172.19.0.4",
-            operational_guest.coroot_agent_address(
-                {
-                    "NetworkSettings": {
-                        "Networks": {"lease-network": {"IPAddress": "172.19.0.4"}}
-                    }
-                }
-            ),
-        )
+        self.assertNotEqual(0, oversized.returncode)
+        self.assertEqual(65, len(oversized.stdout))
 
-        invalid = {
-            "missing": {},
-            "malformed": {"NetworkSettings": {"Networks": []}},
-            "empty": {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": ""}}}},
-            "malformed-address": {
-                "NetworkSettings": {
-                    "Networks": {"bridge": {"IPAddress": "not-an-ip"}}
-                }
-            },
-            "public-address": {
-                "NetworkSettings": {
-                    "Networks": {"bridge": {"IPAddress": "8.8.8.8"}}
-                }
-            },
-            "ambiguous": {
-                "NetworkSettings": {
-                    "Networks": {
-                        "first": {"IPAddress": "172.20.0.2"},
-                        "second": {"IPAddress": "172.21.0.2"},
-                    }
-                }
-            },
+        started = time.monotonic()
+        timed_out = operational_guest.bounded_command_output(
+            [sys.executable, "-c", "import time; time.sleep(2)"],
+            output_limit=64,
+            timeout=1,
+        )
+        self.assertNotEqual(0, timed_out.returncode)
+        self.assertLess(time.monotonic() - started, 1.8)
+
+    def test_coroot_metrics_probe_retries_failures_before_success(self) -> None:
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
         }
-        for label, inspect_row in invalid.items():
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(
-                    operational_guest.DeployError,
-                    "network inspection|unambiguous private container address|"
-                    "private container address is invalid|must be private IPv4",
-                ):
-                    operational_guest.coroot_agent_address(inspect_row)
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+        attempts = [
+            SimpleNamespace(returncode=-9, stdout=b""),
+            SimpleNamespace(returncode=1, stdout=b""),
+            SimpleNamespace(returncode=-9, stdout=b"x" * 2_000_001),
+            SimpleNamespace(returncode=0, stdout=b"metrics without marker\n"),
+            SimpleNamespace(returncode=0, stdout=b"node_agent_info 1\n"),
+        ]
+        with (
+            mock.patch.object(operational_guest, "docker", return_value=inspection),
+            mock.patch.object(operational_guest, "bounded_command_output", side_effect=attempts) as probe,
+            mock.patch.object(operational_guest.time, "sleep"),
+        ):
+            operational_guest.wait_coroot_node_agent("coroot-ephemeral-test-key-not-real")
+        self.assertEqual(5, probe.call_count)
+
+    def test_coroot_metrics_probe_fails_at_the_deadline(self) -> None:
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+        }
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+        clock = SimpleNamespace(now=0.0)
+
+        def monotonic() -> float:
+            return clock.now
+
+        def sleep(seconds: float) -> None:
+            clock.now += seconds
+
+        with (
+            mock.patch.object(operational_guest, "docker", return_value=inspection),
+            mock.patch.object(
+                operational_guest,
+                "bounded_command_output",
+                return_value=SimpleNamespace(returncode=1, stdout=b""),
+            ),
+            mock.patch.object(operational_guest.time, "sleep", side_effect=sleep),
+            mock.patch.object(operational_guest.time, "monotonic", side_effect=monotonic),
+        ):
+            with self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "namespace-local metrics endpoint is unavailable",
+            ):
+                operational_guest.wait_coroot_node_agent(
+                    "coroot-ephemeral-test-key-not-real",
+                    timeout=1,
+                )
+        self.assertEqual(1.0, clock.now)
+
+    def test_coroot_metrics_probe_clamps_each_operation_to_the_deadline(self) -> None:
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+        }
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+        clock = SimpleNamespace(now=0.0)
+        observed: dict[str, float] = {}
+
+        def monotonic() -> float:
+            return clock.now
+
+        def inspect(*arguments: str, **kwargs: object) -> SimpleNamespace:
+            observed["inspect_timeout"] = float(kwargs["timeout"])
+            clock.now = 89.0
+            return inspection
+
+        def probe(*args: object, **kwargs: object) -> SimpleNamespace:
+            observed["probe_timeout"] = float(kwargs["timeout"])
+            clock.now += observed["probe_timeout"]
+            return SimpleNamespace(returncode=1, stdout=b"")
+
+        with (
+            mock.patch.object(operational_guest, "docker", side_effect=inspect),
+            mock.patch.object(operational_guest, "bounded_command_output", side_effect=probe),
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+            mock.patch.object(operational_guest.time, "monotonic", side_effect=monotonic),
+        ):
+            with self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "namespace-local metrics endpoint is unavailable",
+            ):
+                operational_guest.wait_coroot_node_agent(
+                    "coroot-ephemeral-test-key-not-real",
+                    timeout=90,
+                )
+
+        self.assertEqual(90.0, observed["inspect_timeout"])
+        self.assertEqual(1.0, observed["probe_timeout"])
+        self.assertEqual(90.0, clock.now)
+        sleep.assert_not_called()
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
