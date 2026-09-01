@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import stat
@@ -131,6 +132,12 @@ def operational_config() -> dict:
 
 
 class OperationalContractTests(unittest.TestCase):
+    def test_guest_private_ip_validation_dependency_is_loaded(self) -> None:
+        self.assertEqual(
+            ipaddress.ip_address("192.168.2.197"),
+            operational_guest.ipaddress.ip_address("192.168.2.197"),
+        )
+
     def test_workflow_summary_contains_real_lifecycle_links(self) -> None:
         workflow = (ROOT / ".github/workflows/deploy-jeeb-operational.yml").read_text(encoding="utf-8")
 
