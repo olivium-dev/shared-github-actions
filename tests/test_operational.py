@@ -381,6 +381,58 @@ class OperationalContractTests(unittest.TestCase):
         self.assertNotIn("--publish", run_call)
         self.assertIn("/run/secrets/coroot-api-key", serialized)
 
+    def test_coroot_agent_address_supports_modern_and_legacy_inspect_shapes(self) -> None:
+        self.assertEqual(
+            "172.17.0.2",
+            operational_guest.coroot_agent_address(
+                {"NetworkSettings": {"IPAddress": "172.17.0.2"}}
+            ),
+        )
+        self.assertEqual(
+            "172.17.0.3",
+            operational_guest.coroot_agent_address(
+                {
+                    "NetworkSettings": {
+                        "Networks": {
+                            "bridge": {"IPAddress": "172.17.0.3"},
+                            "secondary": {"IPAddress": "172.18.0.3"},
+                        }
+                    }
+                }
+            ),
+        )
+        self.assertEqual(
+            "172.19.0.4",
+            operational_guest.coroot_agent_address(
+                {
+                    "NetworkSettings": {
+                        "Networks": {"lease-network": {"IPAddress": "172.19.0.4"}}
+                    }
+                }
+            ),
+        )
+
+        invalid = {
+            "missing": {},
+            "malformed": {"NetworkSettings": {"Networks": []}},
+            "empty": {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": ""}}}},
+            "ambiguous": {
+                "NetworkSettings": {
+                    "Networks": {
+                        "first": {"IPAddress": "172.20.0.2"},
+                        "second": {"IPAddress": "172.21.0.2"},
+                    }
+                }
+            },
+        }
+        for label, inspect_row in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    operational_guest.DeployError,
+                    "network inspection|unambiguous private container address",
+                ):
+                    operational_guest.coroot_agent_address(inspect_row)
+
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
         catalog = {

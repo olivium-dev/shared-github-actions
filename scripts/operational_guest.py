@@ -565,6 +565,33 @@ def write_restricted_secret(path: Path, value: str) -> None:
         raise
 
 
+def coroot_agent_address(inspect_row: dict[str, Any]) -> str:
+    network_settings = inspect_row.get("NetworkSettings")
+    require(isinstance(network_settings, dict), "Coroot agent network inspection is unavailable")
+
+    legacy = network_settings.get("IPAddress")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+
+    networks = network_settings.get("Networks")
+    require(isinstance(networks, dict), "Coroot agent network inspection is unavailable")
+    bridge = networks.get("bridge")
+    if isinstance(bridge, dict):
+        address = bridge.get("IPAddress")
+        if isinstance(address, str) and address:
+            return address
+
+    addresses = {
+        details.get("IPAddress")
+        for details in networks.values()
+        if isinstance(details, dict)
+        and isinstance(details.get("IPAddress"), str)
+        and details.get("IPAddress")
+    }
+    require(len(addresses) == 1, "Coroot agent has no unambiguous private container address")
+    return addresses.pop()
+
+
 def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
     deadline = time.monotonic() + timeout
     last = "container has not started"
@@ -589,8 +616,7 @@ def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
             last = row["State"].get("Status", "not running")
             time.sleep(3)
             continue
-        address = row["NetworkSettings"]["IPAddress"]
-        require(isinstance(address, str) and address, "Coroot agent has no private container address")
+        address = coroot_agent_address(row)
         try:
             with urllib.request.urlopen(f"http://{address}:80/metrics", timeout=5) as response:
                 metrics = response.read(2_000_000)
