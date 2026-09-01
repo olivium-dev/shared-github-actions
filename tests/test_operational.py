@@ -71,7 +71,7 @@ def heartbeat_lease(*, deadline_seconds: float = 120.0, **updates: object) -> di
     return lease
 
 
-def start_slow_drip_server(body: bytes, delay_seconds: float) -> tuple:
+def start_slow_drip_server(body: bytes, delay_seconds: float, status: int = 200) -> tuple:
     class SlowDripHandler(http.server.BaseHTTPRequestHandler):
         get_count = 0
         post_count = 0
@@ -81,7 +81,7 @@ def start_slow_drip_server(body: bytes, delay_seconds: float) -> tuple:
                 type(self).get_count += 1
             else:
                 type(self).post_count += 1
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -114,7 +114,10 @@ def start_reflecting_error_server() -> tuple:
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(reflected)))
             self.end_headers()
-            self.wfile.write(reflected)
+            try:
+                self.wfile.write(reflected)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         do_GET = _respond
         do_POST = _respond
@@ -404,6 +407,41 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.75)
 
+    def test_slow_drip_http_error_body_cannot_hide_manager_or_oidc_status(self) -> None:
+        server, thread, _ = start_slow_drip_server(b"x" * 100, 0.05, status=409)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(common.HttpRequestError) as manager_error:
+                common.request_json(
+                    "POST",
+                    f"http://127.0.0.1:{server.server_port}/manager",
+                    body={"test": True},
+                    timeout=0.6,
+                )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ACTIONS_ID_TOKEN_REQUEST_URL": f"http://127.0.0.1:{server.server_port}/oidc",
+                        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "test-request-token",
+                    },
+                    clear=True,
+                ),
+                self.assertRaises(common.OidcHttpRequestError) as oidc_error,
+            ):
+                common.oidc_token("test-audience", timeout=0.6)
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertEqual(409, manager_error.exception.status)
+        self.assertTrue(manager_error.exception.retryable)
+        self.assertEqual(409, oidc_error.exception.status)
+        self.assertFalse(oidc_error.exception.retryable)
+        self.assertLess(elapsed, 0.75)
+
     def test_http_request_error_retryability_is_explicit(self) -> None:
         expected = {400: False, 401: False, 403: False, 409: True, 429: True, 500: True, 503: True}
         for status, retryable in expected.items():
@@ -419,6 +457,14 @@ class OperationalContractTests(unittest.TestCase):
     def test_reflected_bearer_credentials_never_reach_manager_or_oidc_errors(self) -> None:
         opaque_token = "opaque-credential-value-that-must-not-escape"
         server, thread = start_reflecting_error_server()
+        create_client = manager_client.ManagerClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
         try:
             with self.assertRaises(common.HttpRequestError) as manager_error:
                 common.request_json(
@@ -427,6 +473,11 @@ class OperationalContractTests(unittest.TestCase):
                     bearer=opaque_token,
                     timeout=2.0,
                 )
+            with (
+                mock.patch.object(create_client, "fresh_token", return_value=opaque_token),
+                self.assertRaises(common.HttpRequestError) as create_error,
+            ):
+                create_client.create({"deploymentId": "test"}, "test-idempotency-key")
             with (
                 mock.patch.dict(
                     os.environ,
@@ -445,6 +496,7 @@ class OperationalContractTests(unittest.TestCase):
             thread.join(timeout=1)
 
         self.assertNotIn(opaque_token, str(manager_error.exception))
+        self.assertNotIn(opaque_token, str(create_error.exception))
         self.assertNotIn(opaque_token, str(oidc_error.exception))
         self.assertEqual("[REDACTED]", common.redact(f"Bearer {opaque_token}"))
 

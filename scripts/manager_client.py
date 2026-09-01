@@ -20,11 +20,11 @@ from common import (
     MANAGER_AUDIENCE,
     MANAGER_URL,
     TransientRequestError,
+    bounded_request,
     canonical_sha256,
     https_url,
     oidc_token,
     read_json,
-    redact,
     request_json,
     require,
     strict_keys,
@@ -242,10 +242,6 @@ def request_json_with_headers(
     headers: dict[str, str],
     expected: tuple[int, ...],
 ) -> tuple[Any, dict[str, str]]:
-    import ssl
-    import urllib.error
-    import urllib.request
-
     request_headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {bearer}",
@@ -253,15 +249,14 @@ def request_json_with_headers(
         "User-Agent": "olivium-jeeb-ephemeral/1",
         **headers,
     }
-    request = urllib.request.Request(url, data=json.dumps(body, sort_keys=True, separators=(",", ":")).encode(), headers=request_headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30, context=ssl.create_default_context()) as response:
-            raw = response.read()
-            status = response.status
-            response_headers = dict(response.headers.items())
-    except urllib.error.HTTPError as exc:
-        detail = exc.read(16_384).decode("utf-8", errors="replace")
-        raise ContractError(f"manager returned HTTP {exc.code}: {redact(detail[:1024])}") from exc
+    status, response_headers, raw = bounded_request(
+        method,
+        url,
+        headers=request_headers,
+        data=json.dumps(body, sort_keys=True, separators=(",", ":")).encode(),
+        timeout=30.0,
+        max_response_bytes=1_048_576,
+    )
     require(status in expected, f"manager returned unexpected HTTP {status}")
     try:
         return json.loads(raw), response_headers

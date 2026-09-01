@@ -83,8 +83,9 @@ def _bounded_request_worker(
             raw = response.read(max_response_bytes + 1)
             sender.send(("success", response.status, list(response.headers.items()), raw))
     except urllib.error.HTTPError as exc:
-        exc.read(max_response_bytes + 1)
-        sender.send(("http", exc.code, [], b""))
+        status = exc.code
+        exc.close()
+        sender.send(("http", status, [], b""))
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
         sender.send(("transport", 0, [], str(detail)))
@@ -364,7 +365,7 @@ def request_bytes(
             status = response.status
             response_headers = dict(response.headers.items())
     except urllib.error.HTTPError as exc:
-        exc.read(16_384)
+        exc.close()
         raise ContractError(f"HTTP {exc.code} from source broker") from exc
     except urllib.error.URLError as exc:
         raise ContractError(f"source broker request failed: {exc.reason}") from exc
