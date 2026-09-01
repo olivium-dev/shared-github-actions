@@ -21,13 +21,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from common import ContractError, canonical_sha256, require, write_github_output, write_json
+from common import (
+    ContractError,
+    HttpRequestError,
+    TransientRequestError,
+    canonical_sha256,
+    require,
+    write_github_output,
+    write_json,
+)
 from manager_client import ManagerClient
 from operational_seed import SeedContractError, seed_counts, seed_digest, validate_seed_data
 
 
 IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+HEARTBEAT_OPERATION_BUDGET_SECONDS = 60.0
+HEARTBEAT_DEADLINE_SAFETY_SECONDS = 10.0
+HEARTBEAT_PROGRESS_ATTEMPTS = 2
+HEARTBEAT_RECONCILIATION_ATTEMPTS = 3
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Heartbeat:
@@ -78,35 +94,117 @@ class Heartbeat:
                 return
 
     def _progress_with_recovery(self, phase: str) -> dict[str, Any]:
+        deadline = self._operation_deadline()
         attempted = dict(self.lease)
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(HEARTBEAT_PROGRESS_ATTEMPTS):
             try:
-                return self.client.progress(attempted, phase)
-            except Exception as exc:
+                return self.client.progress_once_before(attempted, phase, deadline)
+            except (TransientRequestError, HttpRequestError) as exc:
+                if isinstance(exc, HttpRequestError) and not exc.retryable:
+                    raise
                 last_error = exc
-                current = self.client.lease(str(attempted["leaseId"]))
-                require(
-                    current.get("deploymentId") == attempted.get("deploymentId")
-                    and current.get("deploymentLockHash") == attempted.get("deploymentLockHash"),
-                    "manager heartbeat reconciliation changed lease identity",
-                )
-                require(
-                    current.get("state") not in {"cleanup_pending", "deleted"},
-                    f"manager lease entered {current.get('state')} during heartbeat reconciliation",
-                )
-                current_version = current.get("stateVersion")
-                attempted_version = attempted.get("stateVersion")
-                require(
-                    isinstance(current_version, int) and isinstance(attempted_version, int),
-                    "manager heartbeat reconciliation returned an invalid stateVersion",
-                )
-                if current.get("state") == phase and current_version > attempted_version:
-                    return current
-                attempted = current
-                if attempt < 2:
-                    time.sleep(attempt + 1)
+            current = self._reconcile(attempted, phase, deadline)
+            if self._progress_was_applied(attempted, current, phase):
+                self._reconciliation_event(attempt + 1, "applied")
+                return current
+            self._reconciliation_event(attempt + 1, "not_applied")
+            attempted = current
+            if attempt + 1 < HEARTBEAT_PROGRESS_ATTEMPTS:
+                self._sleep_before_deadline(attempt + 1, deadline)
         raise ContractError(f"manager heartbeat failed after reconciliation: {last_error}")
+
+    def _operation_deadline(self) -> float:
+        raw_deadline = self.lease.get("heartbeatDeadline")
+        require(isinstance(raw_deadline, str), "manager lease heartbeatDeadline is missing")
+        try:
+            manager_deadline = datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ContractError("manager lease heartbeatDeadline is invalid") from exc
+        require(manager_deadline.tzinfo is not None, "manager lease heartbeatDeadline must include a timezone")
+        manager_budget = (manager_deadline - utc_now()).total_seconds() - HEARTBEAT_DEADLINE_SAFETY_SECONDS
+        require(manager_budget > 0, "manager lease heartbeat deadline is too close for a safe progress request")
+        return time.monotonic() + min(HEARTBEAT_OPERATION_BUDGET_SECONDS, manager_budget)
+
+    def _reconcile(self, attempted: dict[str, Any], phase: str, deadline: float) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for read_attempt in range(HEARTBEAT_RECONCILIATION_ATTEMPTS):
+            self._require_time(deadline)
+            try:
+                current = self.client.lease_once_before(str(attempted["leaseId"]), deadline)
+            except (TransientRequestError, HttpRequestError) as exc:
+                if isinstance(exc, HttpRequestError) and not exc.retryable:
+                    raise
+                last_error = exc
+                if read_attempt + 1 < HEARTBEAT_RECONCILIATION_ATTEMPTS:
+                    self._sleep_before_deadline(read_attempt + 1, deadline)
+                    continue
+                raise ContractError("manager heartbeat reconciliation read failed") from last_error
+            self._validate_reconciliation(attempted, current, phase)
+            return current
+        raise ContractError("manager heartbeat reconciliation ended unexpectedly") from last_error
+
+    @staticmethod
+    def _validate_reconciliation(
+        attempted: dict[str, Any],
+        current: dict[str, Any],
+        phase: str,
+    ) -> None:
+        require(current.get("leaseId") == attempted.get("leaseId"), "manager heartbeat reconciliation changed lease")
+        require(
+            current.get("deploymentId") == attempted.get("deploymentId"),
+            "manager heartbeat reconciliation changed deployment",
+        )
+        require(
+            current.get("deploymentLockHash") == attempted.get("deploymentLockHash"),
+            "manager heartbeat reconciliation changed deployment lock",
+        )
+        attempted_version = attempted.get("stateVersion")
+        current_version = current.get("stateVersion")
+        require(
+            type(attempted_version) is int and type(current_version) is int,
+            "manager heartbeat reconciliation returned an invalid stateVersion",
+        )
+        require(current_version >= attempted_version, "manager heartbeat reconciliation regressed stateVersion")
+        require(
+            current.get("state") in {attempted.get("state"), phase},
+            "manager heartbeat reconciliation found an unexpected state",
+        )
+        applied = current.get("state") == phase and current_version > attempted_version
+        unchanged = (
+            current.get("state") == attempted.get("state")
+            and current_version == attempted_version
+        )
+        require(applied or unchanged, "manager heartbeat reconciliation could not prove progress outcome")
+
+    @staticmethod
+    def _progress_was_applied(
+        attempted: dict[str, Any],
+        current: dict[str, Any],
+        phase: str,
+    ) -> bool:
+        return current["state"] == phase and current["stateVersion"] > attempted["stateVersion"]
+
+    @staticmethod
+    def _require_time(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0.05, "manager heartbeat recovery deadline exhausted")
+        return remaining
+
+    @classmethod
+    def _sleep_before_deadline(cls, seconds: float, deadline: float) -> None:
+        remaining = cls._require_time(deadline)
+        time.sleep(min(seconds, remaining))
+
+    @staticmethod
+    def _reconciliation_event(attempt: int, outcome: str) -> None:
+        print(
+            json.dumps(
+                {"event": "manager_heartbeat_reconciled", "attempt": attempt, "outcome": outcome},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
 
 
 def load_json(path: Path) -> dict[str, Any]:

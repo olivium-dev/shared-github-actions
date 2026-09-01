@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,19 @@ SERVICE_IDS = (
     "voice-transcription-service",
     "wallet-service",
 )
+
+
+def heartbeat_lease(*, deadline_seconds: float = 120.0, **updates: object) -> dict:
+    lease = {
+        "leaseId": "solar-piplup-26",
+        "deploymentId": "jeeb-gh-1-1",
+        "deploymentLockHash": "a" * 64,
+        "state": "deploying",
+        "stateVersion": 4,
+        "heartbeatDeadline": (datetime.now(timezone.utc) + timedelta(seconds=deadline_seconds)).isoformat(),
+    }
+    lease.update(updates)
+    return lease
 
 
 def seed_data() -> dict:
@@ -234,6 +248,29 @@ class OperationalContractTests(unittest.TestCase):
                 client.request("POST", "/api/automation/v1/leases/one/progress", {})
         self.assertEqual(1, request.call_count)
 
+    def test_manager_progress_request_clamps_token_and_http_to_deadline(self) -> None:
+        client = manager_client.ManagerClient(
+            base_url="http://127.0.0.1:1",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        lease = heartbeat_lease()
+        with (
+            mock.patch.object(manager_client.time, "monotonic", side_effect=[100.0, 101.0]),
+            mock.patch.object(client, "fresh_token", return_value="token") as token,
+            mock.patch.object(manager_client, "request_json", return_value=({"stateVersion": 5}, {})) as request,
+        ):
+            self.assertEqual(
+                {"stateVersion": 5},
+                client.progress_once_before(lease, "deploying", 104.0),
+            )
+
+        token.assert_called_once_with(timeout_seconds=4.0)
+        self.assertEqual(3.0, request.call_args.kwargs["timeout"])
+
     def test_deployment_lock_is_canonical_and_covers_exact_service_set(self) -> None:
         config = operational_config()
         catalog = {
@@ -353,43 +390,148 @@ class OperationalContractTests(unittest.TestCase):
             self.assertNotIn("sk-ephemeral-test-key-not-real", rendered_commands)
 
     def test_heartbeat_reconciles_a_transient_progress_failure(self) -> None:
-        lease = {
-            "leaseId": "solar-piplup-26",
-            "deploymentId": "jeeb-gh-1-1",
-            "deploymentLockHash": "a" * 64,
-            "state": "deploying",
-            "stateVersion": 4,
-        }
+        lease = heartbeat_lease()
         refreshed = {**lease, "stateVersion": 5}
         client = mock.Mock()
-        client.progress.side_effect = (operational_orchestrate.ContractError("transient"), refreshed)
-        client.lease.return_value = lease
+        client.progress_once_before.side_effect = (
+            operational_orchestrate.TransientRequestError("transient"),
+            refreshed,
+        )
+        client.lease_once_before.return_value = lease
         heartbeat = operational_orchestrate.Heartbeat(client, lease)
 
         with mock.patch.object(operational_orchestrate.time, "sleep"):
             result = heartbeat.transition("deploying")
 
         self.assertEqual(5, result["stateVersion"])
-        self.assertEqual(2, client.progress.call_count)
+        self.assertEqual(2, client.progress_once_before.call_count)
+        client.lease_once_before.assert_called_once()
 
     def test_heartbeat_accepts_a_progress_response_lost_after_commit(self) -> None:
-        lease = {
-            "leaseId": "solar-piplup-26",
-            "deploymentId": "jeeb-gh-1-1",
-            "deploymentLockHash": "a" * 64,
-            "state": "deploying",
-            "stateVersion": 4,
-        }
+        lease = heartbeat_lease()
         refreshed = {**lease, "stateVersion": 5}
         client = mock.Mock()
-        client.progress.side_effect = operational_orchestrate.ContractError("response lost")
-        client.lease.return_value = refreshed
+        client.progress_once_before.side_effect = operational_orchestrate.TransientRequestError("response lost")
+        client.lease_once_before.return_value = refreshed
         heartbeat = operational_orchestrate.Heartbeat(client, lease)
 
         result = heartbeat.transition("deploying")
 
         self.assertEqual(5, result["stateVersion"])
-        client.progress.assert_called_once()
+        client.progress_once_before.assert_called_once()
+
+    def test_heartbeat_never_reposts_after_unresolved_reconciliation(self) -> None:
+        lease = heartbeat_lease()
+        client = mock.Mock()
+        client.progress_once_before.side_effect = operational_orchestrate.TransientRequestError("response lost")
+        client.lease_once_before.side_effect = operational_orchestrate.TransientRequestError("OIDC unavailable")
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        with (
+            mock.patch.object(operational_orchestrate.time, "sleep"),
+            self.assertRaisesRegex(operational_orchestrate.ContractError, "reconciliation read failed"),
+        ):
+            heartbeat.transition("deploying")
+
+        self.assertEqual(1, client.progress_once_before.call_count)
+        self.assertEqual(3, client.lease_once_before.call_count)
+
+    def test_heartbeat_retries_reconciliation_read_before_reposting(self) -> None:
+        lease = heartbeat_lease()
+        refreshed = {**lease, "stateVersion": 5}
+        client = mock.Mock()
+        client.progress_once_before.side_effect = (
+            operational_orchestrate.TransientRequestError("response lost"),
+            refreshed,
+        )
+        client.lease_once_before.side_effect = (
+            operational_orchestrate.TransientRequestError("OIDC unavailable"),
+            lease,
+        )
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        with mock.patch.object(operational_orchestrate.time, "sleep"):
+            result = heartbeat.transition("deploying")
+
+        self.assertEqual(5, result["stateVersion"])
+        self.assertEqual(2, client.progress_once_before.call_count)
+        self.assertEqual(2, client.lease_once_before.call_count)
+
+    def test_heartbeat_fails_closed_on_reconciliation_auth_error(self) -> None:
+        lease = heartbeat_lease()
+        client = mock.Mock()
+        client.progress_once_before.side_effect = operational_orchestrate.TransientRequestError("response lost")
+        client.lease_once_before.side_effect = operational_orchestrate.ContractError("OIDC environment mismatch")
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        with self.assertRaisesRegex(operational_orchestrate.ContractError, "OIDC environment mismatch"):
+            heartbeat.transition("deploying")
+
+        client.progress_once_before.assert_called_once()
+        client.lease_once_before.assert_called_once()
+
+    def test_heartbeat_fails_closed_on_every_reconciliation_contract_mismatch(self) -> None:
+        lease = heartbeat_lease()
+        mismatches = {
+            "lease": {**lease, "leaseId": "other-lease"},
+            "deployment": {**lease, "deploymentId": "other-deployment"},
+            "lock": {**lease, "deploymentLockHash": "b" * 64},
+            "state": {**lease, "state": "cleanup_pending"},
+            "regressed_version": {**lease, "stateVersion": 3},
+            "boolean_version": {**lease, "stateVersion": True},
+            "malformed_version": {**lease, "stateVersion": "4"},
+            "unproven_version": {**lease, "state": "infrastructure_ready", "stateVersion": 5},
+        }
+        for name, current in mismatches.items():
+            with self.subTest(name=name):
+                client = mock.Mock()
+                client.progress_once_before.side_effect = operational_orchestrate.TransientRequestError("response lost")
+                client.lease_once_before.return_value = current
+                heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+                with self.assertRaises(operational_orchestrate.ContractError):
+                    heartbeat.transition("deploying")
+
+                client.progress_once_before.assert_called_once()
+                client.lease_once_before.assert_called_once()
+
+    def test_heartbeat_does_not_reconcile_a_nontransport_contract_error(self) -> None:
+        lease = heartbeat_lease()
+        client = mock.Mock()
+        client.progress_once_before.side_effect = operational_orchestrate.ContractError("OIDC environment mismatch")
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        with self.assertRaisesRegex(operational_orchestrate.ContractError, "OIDC environment mismatch"):
+            heartbeat.transition("deploying")
+
+        client.progress_once_before.assert_called_once()
+        client.lease_once_before.assert_not_called()
+
+    def test_heartbeat_recovery_stops_before_manager_deadline(self) -> None:
+        wall_now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        lease = heartbeat_lease(
+            heartbeatDeadline=(wall_now + timedelta(seconds=12)).isoformat(),
+        )
+        clock = [100.0]
+        client = mock.Mock()
+
+        def consume_budget(*_args: object) -> dict:
+            clock[0] += 2.0
+            raise operational_orchestrate.TransientRequestError("request timed out")
+
+        client.progress_once_before.side_effect = consume_budget
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+        with (
+            mock.patch.object(operational_orchestrate, "utc_now", return_value=wall_now),
+            mock.patch.object(operational_orchestrate.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertRaisesRegex(operational_orchestrate.ContractError, "deadline exhausted"),
+        ):
+            heartbeat.transition("deploying")
+
+        self.assertLessEqual(clock[0], 102.0)
+        client.progress_once_before.assert_called_once()
+        client.lease_once_before.assert_not_called()
 
     def test_detached_guest_deploy_survives_a_transient_poll_disconnect(self) -> None:
         poll_attempts = 0

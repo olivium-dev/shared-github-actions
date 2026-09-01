@@ -38,6 +38,22 @@ class ContractError(RuntimeError):
     """Raised when an owner-reviewed contract fails closed."""
 
 
+class TransientRequestError(ContractError):
+    """Raised when a trusted request may be retried within an explicit deadline."""
+
+
+class HttpRequestError(ContractError):
+    """Raised when a trusted endpoint returns a non-success HTTP status."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return self.status == 409 or self.status == 429 or self.status >= 500
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ContractError(message)
@@ -154,7 +170,7 @@ def extract_tar_safely(source: Path, destination: Path, *, max_bytes: int = 2_00
         archive.extractall(destination, members=members, filter="data")
 
 
-def oidc_token(audience: str, *, static_env: str | None = None) -> str:
+def oidc_token(audience: str, *, static_env: str | None = None, timeout: float = 20.0) -> str:
     if static_env:
         token = os.environ.get(static_env, "")
         require(bool(token), f"{static_env} is required")
@@ -170,10 +186,10 @@ def oidc_token(audience: str, *, static_env: str | None = None) -> str:
         headers={"Authorization": f"Bearer {request_token}", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=20, context=ssl.create_default_context()) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
             payload = json.load(response)
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise ContractError(f"GitHub OIDC token request failed: {exc}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise TransientRequestError(f"GitHub OIDC token request failed: {exc}") from exc
     require(isinstance(payload, dict) and isinstance(payload.get("value"), str), "GitHub OIDC response is invalid")
     return payload["value"]
 
@@ -185,7 +201,7 @@ def request_json(
     bearer: str | None = None,
     body: Any | None = None,
     expected: tuple[int, ...] = (200,),
-    timeout: int = 30,
+    timeout: float = 30.0,
 ) -> tuple[Any, Mapping[str, str]]:
     headers = {"Accept": "application/json", "User-Agent": "olivium-jeeb-ephemeral/1"}
     data = None
@@ -203,9 +219,13 @@ def request_json(
     except urllib.error.HTTPError as exc:
         raw = exc.read(16_384)
         detail = raw.decode("utf-8", errors="replace")
-        raise ContractError(f"HTTP {exc.code} from trusted endpoint: {redact(detail)}") from exc
-    except urllib.error.URLError as exc:
-        raise ContractError(f"trusted endpoint request failed: {exc.reason}") from exc
+        raise HttpRequestError(
+            exc.code,
+            f"HTTP {exc.code} from trusted endpoint: {redact(detail)}",
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        raise TransientRequestError(f"trusted endpoint request failed: {detail}") from exc
     require(status in expected, f"trusted endpoint returned unexpected HTTP {status}")
     try:
         payload = json.loads(raw) if raw else None

@@ -16,8 +16,10 @@ from typing import Any
 
 from common import (
     ContractError,
+    HttpRequestError,
     MANAGER_AUDIENCE,
     MANAGER_URL,
+    TransientRequestError,
     canonical_sha256,
     https_url,
     oidc_token,
@@ -69,8 +71,12 @@ class ManagerClient:
         self.expected_environment = expected_environment
         self.static_oidc_env = static_oidc_env
 
-    def fresh_token(self) -> str:
-        token = oidc_token(self.audience, static_env=self.static_oidc_env)
+    def fresh_token(self, timeout_seconds: float = 20.0) -> str:
+        token = oidc_token(
+            self.audience,
+            static_env=self.static_oidc_env,
+            timeout=timeout_seconds,
+        )
         claims = decode_jwt_payload(token)
         audience = claims.get("aud")
         audience_values = audience if isinstance(audience, list) else [audience]
@@ -97,14 +103,11 @@ class ManagerClient:
                 )
                 require(isinstance(payload, dict), "manager response must be an object")
                 return payload
-            except (TimeoutError, OSError) as exc:
+            except (TimeoutError, OSError, TransientRequestError) as exc:
                 if attempt + 1 == attempts:
                     raise ContractError(f"manager read failed after transient retries: {exc}") from exc
-            except ContractError as exc:
-                retryable = str(exc).startswith(
-                    ("trusted endpoint request failed:", "GitHub OIDC token request failed:")
-                )
-                if not retryable or attempt + 1 == attempts:
+            except HttpRequestError as exc:
+                if not exc.retryable or attempt + 1 == attempts:
                     raise
             time.sleep(attempt + 1)
         raise ContractError("manager read retry loop ended unexpectedly")
@@ -135,6 +138,36 @@ class ManagerClient:
     def lease(self, lease_id: str) -> dict[str, Any]:
         return self.request("GET", f"/api/automation/v1/leases/{urllib.parse.quote(lease_id, safe='')}")
 
+    @staticmethod
+    def _remaining_timeout(deadline: float, maximum: float) -> float:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0.05, "manager heartbeat request deadline exhausted")
+        return min(maximum, remaining)
+
+    def _request_once_before(
+        self,
+        method: str,
+        path: str,
+        *,
+        deadline: float,
+        body: Any | None = None,
+    ) -> dict[str, Any]:
+        require(path.startswith("/api/automation/v1/"), "manager API path is outside the automation boundary")
+        token = self.fresh_token(timeout_seconds=self._remaining_timeout(deadline, 5.0))
+        payload, _ = request_json(
+            method,
+            f"{self.base_url}{path}",
+            bearer=token,
+            body=body,
+            timeout=self._remaining_timeout(deadline, 8.0),
+        )
+        require(isinstance(payload, dict), "manager response must be an object")
+        return payload
+
+    def lease_once_before(self, lease_id: str, deadline: float) -> dict[str, Any]:
+        path = f"/api/automation/v1/leases/{urllib.parse.quote(lease_id, safe='')}"
+        return self._request_once_before("GET", path, deadline=deadline)
+
     def job(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/api/automation/v1/jobs/{urllib.parse.quote(job_id, safe='')}")
 
@@ -159,6 +192,16 @@ class ManagerClient:
             "phase": phase,
         }
         return self.request("POST", f"/api/automation/v1/leases/{urllib.parse.quote(lease['leaseId'], safe='')}/progress", body)
+
+    def progress_once_before(self, lease: dict[str, Any], phase: str, deadline: float) -> dict[str, Any]:
+        body = {
+            "deploymentId": lease["deploymentId"],
+            "deploymentLockHash": lease["deploymentLockHash"],
+            "stateVersion": lease["stateVersion"],
+            "phase": phase,
+        }
+        path = f"/api/automation/v1/leases/{urllib.parse.quote(lease['leaseId'], safe='')}/progress"
+        return self._request_once_before("POST", path, deadline=deadline, body=body)
 
     def access_grant(self, lease: dict[str, Any], nonce: str) -> dict[str, Any]:
         body = {
