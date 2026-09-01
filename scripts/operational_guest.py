@@ -7,6 +7,7 @@ import argparse
 import base64
 import gzip
 import hashlib
+import ipaddress
 import json
 import os
 import re
