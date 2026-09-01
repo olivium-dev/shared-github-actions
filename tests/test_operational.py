@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import stat
-import subprocess
 import sys
 import tempfile
 import time
@@ -426,7 +425,7 @@ class OperationalContractTests(unittest.TestCase):
             stderr=b"",
         )
         attempts = [
-            subprocess.TimeoutExpired(["docker", "exec"], 10),
+            SimpleNamespace(returncode=-9, stdout=b""),
             SimpleNamespace(returncode=1, stdout=b""),
             SimpleNamespace(returncode=-9, stdout=b"x" * 2_000_001),
             SimpleNamespace(returncode=0, stdout=b"metrics without marker\n"),
@@ -451,6 +450,14 @@ class OperationalContractTests(unittest.TestCase):
             stdout=json.dumps([running]).encode(),
             stderr=b"",
         )
+        clock = SimpleNamespace(now=0.0)
+
+        def monotonic() -> float:
+            return clock.now
+
+        def sleep(seconds: float) -> None:
+            clock.now += seconds
+
         with (
             mock.patch.object(operational_guest, "docker", return_value=inspection),
             mock.patch.object(
@@ -458,8 +465,8 @@ class OperationalContractTests(unittest.TestCase):
                 "bounded_command_output",
                 return_value=SimpleNamespace(returncode=1, stdout=b""),
             ),
-            mock.patch.object(operational_guest.time, "sleep"),
-            mock.patch.object(operational_guest.time, "monotonic", side_effect=[0, 0, 2]),
+            mock.patch.object(operational_guest.time, "sleep", side_effect=sleep),
+            mock.patch.object(operational_guest.time, "monotonic", side_effect=monotonic),
         ):
             with self.assertRaisesRegex(
                 operational_guest.DeployError,
@@ -469,6 +476,54 @@ class OperationalContractTests(unittest.TestCase):
                     "coroot-ephemeral-test-key-not-real",
                     timeout=1,
                 )
+        self.assertEqual(1.0, clock.now)
+
+    def test_coroot_metrics_probe_clamps_each_operation_to_the_deadline(self) -> None:
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+        }
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+        clock = SimpleNamespace(now=0.0)
+        observed: dict[str, float] = {}
+
+        def monotonic() -> float:
+            return clock.now
+
+        def inspect(*arguments: str, **kwargs: object) -> SimpleNamespace:
+            observed["inspect_timeout"] = float(kwargs["timeout"])
+            clock.now = 89.0
+            return inspection
+
+        def probe(*args: object, **kwargs: object) -> SimpleNamespace:
+            observed["probe_timeout"] = float(kwargs["timeout"])
+            clock.now += observed["probe_timeout"]
+            return SimpleNamespace(returncode=1, stdout=b"")
+
+        with (
+            mock.patch.object(operational_guest, "docker", side_effect=inspect),
+            mock.patch.object(operational_guest, "bounded_command_output", side_effect=probe),
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+            mock.patch.object(operational_guest.time, "monotonic", side_effect=monotonic),
+        ):
+            with self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "namespace-local metrics endpoint is unavailable",
+            ):
+                operational_guest.wait_coroot_node_agent(
+                    "coroot-ephemeral-test-key-not-real",
+                    timeout=90,
+                )
+
+        self.assertEqual(90.0, observed["inspect_timeout"])
+        self.assertEqual(1.0, observed["probe_timeout"])
+        self.assertEqual(90.0, clock.now)
+        sleep.assert_not_called()
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()

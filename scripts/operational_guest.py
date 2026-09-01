@@ -138,7 +138,7 @@ def run(
     argv: list[str],
     *,
     stdin: bytes | None = None,
-    timeout: int = 1200,
+    timeout: float = 1200,
     capture: bool = False,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -164,7 +164,7 @@ def bounded_command_output(
     argv: list[str],
     *,
     output_limit: int,
-    timeout: int,
+    timeout: float,
 ) -> subprocess.CompletedProcess[bytes]:
     require(output_limit > 0 and timeout > 0, "bounded command limits are invalid")
     process = subprocess.Popen(
@@ -616,10 +616,26 @@ def write_restricted_secret(path: Path, value: str) -> None:
 def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
     deadline = time.monotonic() + timeout
     last = "container has not started"
-    while time.monotonic() < deadline:
-        inspected = docker("container", "inspect", COROOT_CONTAINER_NAME, capture=True, check=False)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            inspected = docker(
+                "container",
+                "inspect",
+                COROOT_CONTAINER_NAME,
+                capture=True,
+                check=False,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            last = "container inspection timed out"
+            continue
         if inspected.returncode != 0:
-            time.sleep(3)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(3, remaining))
             continue
         try:
             rows = json.loads(inspected.stdout)
@@ -635,29 +651,29 @@ def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
         require(not row["HostConfig"].get("PortBindings"), "Coroot agent publishes a host port")
         if row["State"]["Running"] is not True:
             last = row["State"].get("Status", "not running")
-            time.sleep(3)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(3, remaining))
             continue
-        try:
-            probe = bounded_command_output(
-                [
-                    "docker",
-                    "exec",
-                    COROOT_CONTAINER_NAME,
-                    "/usr/bin/curl",
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--max-time",
-                    "5",
-                    "http://127.0.0.1:10300/metrics",
-                ],
-                output_limit=2_000_000,
-                timeout=10,
-            )
-        except subprocess.TimeoutExpired:
-            last = "namespace-local metrics probe timed out"
-            time.sleep(3)
-            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        probe = bounded_command_output(
+            [
+                "docker",
+                "exec",
+                COROOT_CONTAINER_NAME,
+                "/usr/bin/curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "5",
+                "http://127.0.0.1:10300/metrics",
+            ],
+            output_limit=2_000_000,
+            timeout=min(10, remaining),
+        )
         if (
             probe.returncode == 0
             and len(probe.stdout) <= 2_000_000
@@ -665,7 +681,9 @@ def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
         ):
             return
         last = "namespace-local metrics endpoint is unavailable"
-        time.sleep(3)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(3, remaining))
     raise DeployError(f"Coroot node agent did not become ready: {last}")
 
 
