@@ -1269,6 +1269,13 @@ class OperationalContractTests(unittest.TestCase):
             gateway_routes=[],
         )
         self.assertEqual("X-Api-Key", notification_environment["WEBHOOK_AUTH_HEADER_NAME"])
+        self.assertEqual("true", notification_environment["PUSH_DELIVERY_REQUIRED"])
+        self.assertEqual("true", notification_environment["DISPATCH_WORKER_ENABLED"])
+        self.assertEqual("true", notification_environment["WEBHOOK_ENABLED"])
+        self.assertEqual(
+            "http://push-notification:8080/api/v1/sent-payload/user/",
+            notification_environment["WEBHOOK_BASE_URL"],
+        )
         self.assertEqual(
             "/run/secrets/push_notification_delivery_api_key",
             notification_environment["WEBHOOK_AUTH_HEADER_VALUE_FILE"],
