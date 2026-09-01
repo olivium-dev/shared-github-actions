@@ -545,6 +545,10 @@ def transformed_environment(
             "jeeb_notifications_staging?authSource=admin"
         )
         environment["SKIP_DB_INIT"] = "false"
+        environment["WEBHOOK_AUTH_HEADER_NAME"] = "X-Api-Key"
+        environment["WEBHOOK_AUTH_HEADER_VALUE_FILE"] = (
+            "/run/secrets/push_notification_delivery_api_key"
+        )
 
     for key, value in list(environment.items()):
         if "redis" in key.lower() or "redis://" in value:
@@ -582,7 +586,16 @@ def transformed_environment(
             environment["WHISPER_FAKE_TRANSCRIBE"] = "1"
 
     if service_id == "push-notification":
+        environment.pop("INTERNAL_API_KEY", None)
+        environment.pop("INTERNAL_API_KEY_FILE", None)
+        environment.pop("GATEWAY_API_KEY", None)
+        environment.pop("NOTIFICATION_DELIVERY_API_KEY", None)
         environment["GATEWAY_API_KEY_FILE"] = "/run/secrets/push_gateway_api_key"
+        environment["NOTIFICATION_DELIVERY_API_KEY_FILE"] = (
+            "/run/secrets/push_notification_delivery_api_key"
+        )
+        environment["PUSH_AUTH_MODE"] = "strict"
+        environment["PUSH_PIPELINE_REQUIRED"] = "true"
 
     if service_id == "realtime-comunication-service":
         environment["PHX_HOST"] = public_hostname
@@ -1310,6 +1323,7 @@ def materialize_mounts(
     postgres_password: str,
     openai_api_key: str,
     push_gateway_api_key: str,
+    push_notification_delivery_api_key: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     secret_mounts: list[dict[str, Any]] = []
     for index, mount in enumerate(template_service.get("secrets", [])):
@@ -1366,6 +1380,29 @@ def materialize_mounts(
             }
         )
 
+    if service_id in {"notification-service", "push-notification"}:
+        require(
+            push_notification_delivery_api_key,
+            "ephemeral push notification delivery API key is unavailable",
+        )
+        name = f"{prefix}-push-notification-delivery-api-key"
+        create_secret(
+            name,
+            push_notification_delivery_api_key.encode(),
+            lease_id,
+            lock_hash,
+            deployment_id,
+        )
+        secret_mounts.append(
+            {
+                "name": name,
+                "target": "push_notification_delivery_api_key",
+                "uid": "10001",
+                "gid": "10001",
+                "mode": 0o400,
+            }
+        )
+
     config_mounts: list[dict[str, Any]] = []
     for index, mount in enumerate(template_service.get("configs", [])):
         old_name = mount["name"]
@@ -1403,6 +1440,7 @@ def create_application(
     super_login_passcode: str,
     openai_api_key: str,
     push_gateway_api_key: str,
+    push_notification_delivery_api_key: str,
     public_hostname: str,
     private_ip: str,
     probe_config: str,
@@ -1432,6 +1470,7 @@ def create_application(
         postgres_password=postgres_password,
         openai_api_key=openai_api_key,
         push_gateway_api_key=push_gateway_api_key,
+        push_notification_delivery_api_key=push_notification_delivery_api_key,
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="jeeb-env-", delete=False) as handle:
         for key, value in sorted(environment.items()):
@@ -1685,6 +1724,7 @@ def deploy(args: argparse.Namespace) -> None:
     postgres_password = secrets.token_urlsafe(32)
     mongo_password = secrets.token_urlsafe(32)
     push_gateway_api_key = secrets.token_urlsafe(48)
+    push_notification_delivery_api_key = secrets.token_urlsafe(48)
     ensure_network(network, args.lease_id, lock_hash, args.deployment_id)
     create_infrastructure(
         config,
@@ -1728,6 +1768,7 @@ def deploy(args: argparse.Namespace) -> None:
             super_login_passcode=super_login_passcode,
             openai_api_key=openai_api_key,
             push_gateway_api_key=push_gateway_api_key,
+            push_notification_delivery_api_key=push_notification_delivery_api_key,
             public_hostname=public_hostname,
             private_ip=str(private_ip),
             probe_config=probe_config,
