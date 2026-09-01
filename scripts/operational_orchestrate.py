@@ -41,8 +41,9 @@ HEARTBEAT_DEADLINE_SAFETY_SECONDS = 10.0
 HEARTBEAT_PROGRESS_ATTEMPTS = 2
 HEARTBEAT_RECONCILIATION_ATTEMPTS = 3
 MANAGER_DEADLINE = re.compile(
-    r"^(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
-    r"(?:\.(?P<fraction>[0-9]{1,9}))?(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})$"
+    r"^(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9])"
+    r"(?:\.(?P<fraction>[0-9]{1,9}))?"
+    r"(?P<zone>Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))$"
 )
 
 

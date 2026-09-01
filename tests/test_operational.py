@@ -1133,11 +1133,27 @@ class OperationalContractTests(unittest.TestCase):
             "2026-09-01 17:57:20.3452139+00:00",
             "2026-09-01T17:57:20.3452139",
             "2026-09-01T17:57:20.1234567890+00:00",
+            "2026-09-01T17:57:20.3452139+00:60",
+            "2026-09-01T17:57:20.3452139-00:60",
+            "2026-09-01T17:57:20.3452139+14:01",
+            "2026-09-01T17:57:20.3452139-14:01",
+            "2026-09-01T17:57:20.3452139+23:59",
+            "2026-09-01T24:00:00.3452139+00:00",
             "2026-09-01T25:57:20.3452139+00:00",
         )
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(operational_orchestrate.ContractError):
                 operational_orchestrate.parse_manager_deadline(value)
+
+    def test_manager_deadline_accepts_dotnet_offset_boundaries(self) -> None:
+        for value in (
+            "2026-09-01T17:57:20.3452139+14:00",
+            "2026-09-01T17:57:20.3452139-14:00",
+        ):
+            with self.subTest(value=value):
+                offset = operational_orchestrate.parse_manager_deadline(value).utcoffset()
+                self.assertIsNotNone(offset)
+                self.assertEqual(14 * 60 * 60, abs(offset.total_seconds()))
 
     def test_detached_guest_deploy_survives_a_transient_poll_disconnect(self) -> None:
         poll_attempts = 0
