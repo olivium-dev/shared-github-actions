@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import ipaddress
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -375,6 +377,7 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(3, docker.call_count)
         docker.assert_called_with(
             "pull",
+            "--quiet",
             image,
             timeout=1800,
             capture=True,
@@ -384,21 +387,86 @@ class OperationalContractTests(unittest.TestCase):
 
     def test_digest_pinned_pull_fails_fast_for_registry_auth_errors(self) -> None:
         image = "ghcr.io/olivium-dev/test@sha256:" + "b" * 64
-        denied = SimpleNamespace(
-            returncode=1,
-            stdout=b"",
-            stderr=b"unauthorized: authentication required",
+        permanent_errors = (
+            b"failed to do request: 401 Unauthorized",
+            b"failed to do request: 404 Not Found",
+            b"failed to do request: x509: certificate signed by unknown authority",
         )
 
+        for detail in permanent_errors:
+            with self.subTest(detail=detail):
+                denied = SimpleNamespace(returncode=1, stdout=b"", stderr=detail)
+                with (
+                    mock.patch.object(
+                        operational_guest, "docker", return_value=denied
+                    ) as docker,
+                    mock.patch.object(operational_guest.time, "sleep") as sleep,
+                    self.assertRaisesRegex(
+                        operational_guest.DeployError, "non-retryable error"
+                    ),
+                ):
+                    operational_guest.pull_image(image)
+
+                docker.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_digest_pinned_pull_exhaustion_redacts_signed_registry_url(self) -> None:
+        image = "ghcr.io/olivium-dev/test@sha256:" + "c" * 64
+        signed_url = b'https://pkg-containers.example/blob?sig=do-not-log'
+        reset = SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=b"failed to do request: Get " + signed_url + b": connection reset by peer",
+        )
+        output = io.StringIO()
+
         with (
-            mock.patch.object(operational_guest, "docker", return_value=denied) as docker,
+            mock.patch.object(operational_guest, "docker", return_value=reset) as docker,
             mock.patch.object(operational_guest.time, "sleep") as sleep,
-            self.assertRaisesRegex(operational_guest.DeployError, "non-retryable error"),
+            mock.patch.object(operational_guest.sys, "stderr", output),
+            self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "failed after 3 attempt.*transient network error",
+            ) as raised,
         ):
             operational_guest.pull_image(image)
 
-        docker.assert_called_once()
-        sleep.assert_not_called()
+        self.assertEqual(3, docker.call_count)
+        self.assertEqual([mock.call(5), mock.call(15)], sleep.call_args_list)
+        self.assertNotIn("sig=do-not-log", str(raised.exception))
+        self.assertNotIn("sig=do-not-log", output.getvalue())
+
+    def test_digest_pinned_pull_retries_a_subprocess_timeout(self) -> None:
+        image = "ghcr.io/olivium-dev/test@sha256:" + "d" * 64
+        timeout = subprocess.TimeoutExpired(["docker", "pull", image], 1800)
+        success = SimpleNamespace(returncode=0, stdout=b"pulled", stderr=b"")
+
+        with (
+            mock.patch.object(
+                operational_guest, "docker", side_effect=[timeout, success]
+            ) as docker,
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+        ):
+            operational_guest.pull_image(image)
+
+        self.assertEqual(2, docker.call_count)
+        sleep.assert_called_once_with(5)
+
+    def test_digest_pinned_pull_rejects_malformed_digests_before_docker(self) -> None:
+        malformed = (
+            "ghcr.io/olivium-dev/test:latest",
+            "ghcr.io/olivium-dev/test@sha256:" + "a" * 63,
+            "ghcr.io/olivium-dev/test@sha256:" + "G" * 64,
+        )
+
+        with mock.patch.object(operational_guest, "docker") as docker:
+            for image in malformed:
+                with self.subTest(image=image), self.assertRaisesRegex(
+                    operational_guest.DeployError, "immutable digest"
+                ):
+                    operational_guest.pull_image(image)
+
+        docker.assert_not_called()
 
     def test_coroot_agent_is_pinned_privileged_private_and_secret_file_backed(self) -> None:
         api_key = "coroot-ephemeral-test-key-not-real"

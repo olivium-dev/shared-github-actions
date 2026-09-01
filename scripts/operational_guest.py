@@ -47,6 +47,10 @@ FORBIDDEN = (
     "cms.jeeb.fds-1.com",
 )
 IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
+IMMUTABLE_IMAGE_RE = re.compile(
+    r"^[a-z0-9][a-z0-9./_-]+(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?"
+    r"@sha256:[0-9a-f]{64}$"
+)
 SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 COROOT_NODE_AGENT_IMAGE = (
     "ghcr.io/coroot/coroot-node-agent:1.35.8@"
@@ -63,7 +67,6 @@ TRANSIENT_PULL_ERRORS = (
     "context deadline exceeded",
     "temporary failure in name resolution",
     "network is unreachable",
-    "failed to do request",
 )
 LEGACY_FAKE_VOICE_COMMIT = "8f76393982e224306a30a067636109d3573f2f8b"
 POSTGRES_DATABASES = {
@@ -182,24 +185,27 @@ def docker(*arguments: str, **kwargs: Any) -> subprocess.CompletedProcess[bytes]
 
 
 def pull_image(image: str) -> None:
-    require(
-        "@sha256:" in image and len(image.rsplit("@sha256:", 1)[1]) == 64,
-        "docker pulls must use an immutable digest",
-    )
+    require(IMMUTABLE_IMAGE_RE.fullmatch(image) is not None, "docker pulls must use an immutable digest")
     attempts = len(PULL_RETRY_DELAYS) + 1
     for attempt in range(attempts):
-        result = docker("pull", image, timeout=1800, capture=True, check=False)
-        if result.returncode == 0:
-            return
-
-        detail = ((result.stderr or b"") + (result.stdout or b"")).decode(
-            errors="replace"
-        ).lower()
-        transient = any(marker in detail for marker in TRANSIENT_PULL_ERRORS)
+        try:
+            result = docker(
+                "pull", "--quiet", image, timeout=1800, capture=True, check=False
+            )
+        except subprocess.TimeoutExpired:
+            transient = True
+        else:
+            if result.returncode == 0:
+                return
+            detail = ((result.stderr or b"") + (result.stdout or b"")).decode(
+                errors="replace"
+            ).lower()
+            transient = any(marker in detail for marker in TRANSIENT_PULL_ERRORS)
         if not transient or attempt == attempts - 1:
             failure_type = "transient network error" if transient else "non-retryable error"
+            image_name = image.rsplit("@", 1)[0]
             raise DeployError(
-                f"docker pull failed after {attempt + 1} attempt(s) for immutable image "
+                f"docker pull failed after {attempt + 1} attempt(s) for {image_name} "
                 f"({failure_type})"
             )
 
