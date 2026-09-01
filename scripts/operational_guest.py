@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import select
 import socket
 import stat
 import subprocess
@@ -157,6 +158,54 @@ def run(
 
 def docker(*arguments: str, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
     return run(["docker", *arguments], **kwargs)
+
+
+def bounded_command_output(
+    argv: list[str],
+    *,
+    output_limit: int,
+    timeout: int,
+) -> subprocess.CompletedProcess[bytes]:
+    require(output_limit > 0 and timeout > 0, "bounded command limits are invalid")
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    require(process.stdout is not None, "bounded command output is unavailable")
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while len(output) <= output_limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
+            if not readable:
+                break
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(64 * 1024, output_limit + 1 - len(output)),
+            )
+            if not chunk:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        pass
+                break
+            output.extend(chunk)
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+    return subprocess.CompletedProcess(argv, process.returncode, bytes(output), b"")
 
 
 def decode_chunked_http(body: bytes) -> bytes:
@@ -588,22 +637,27 @@ def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
             last = row["State"].get("Status", "not running")
             time.sleep(3)
             continue
-        probe = docker(
-            "exec",
-            COROOT_CONTAINER_NAME,
-            "/usr/bin/curl",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "5",
-            "--max-filesize",
-            "2000000",
-            "http://127.0.0.1:10300/metrics",
-            capture=True,
-            check=False,
-            timeout=10,
-        )
+        try:
+            probe = bounded_command_output(
+                [
+                    "docker",
+                    "exec",
+                    COROOT_CONTAINER_NAME,
+                    "/usr/bin/curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "5",
+                    "http://127.0.0.1:10300/metrics",
+                ],
+                output_limit=2_000_000,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            last = "namespace-local metrics probe timed out"
+            time.sleep(3)
+            continue
         if (
             probe.returncode == 0
             and len(probe.stdout) <= 2_000_000

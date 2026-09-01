@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -349,14 +351,17 @@ class OperationalContractTests(unittest.TestCase):
                 if sum(1 for call in calls if call[:2] == ("container", "inspect")) == 1:
                     return completed
                 return SimpleNamespace(returncode=0, stdout=json.dumps([running]).encode(), stderr=b"")
-            if arguments[:2] == ("exec", operational_guest.COROOT_CONTAINER_NAME):
-                return SimpleNamespace(returncode=0, stdout=b"node_agent_info 1\n", stderr=b"")
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
         with tempfile.TemporaryDirectory() as temporary_name:
             state_dir = Path(temporary_name)
             with (
                 mock.patch.object(operational_guest, "docker", side_effect=fake_docker),
+                mock.patch.object(
+                    operational_guest,
+                    "bounded_command_output",
+                    return_value=SimpleNamespace(returncode=0, stdout=b"node_agent_info 1\n"),
+                ) as bounded_output,
                 mock.patch.object(operational_guest.urllib.request, "urlopen") as urlopen,
             ):
                 urlopen.return_value.__enter__.return_value.status = 200
@@ -382,15 +387,88 @@ class OperationalContractTests(unittest.TestCase):
         self.assertNotIn(api_key, serialized)
         self.assertNotIn("--publish", run_call)
         self.assertIn("/run/secrets/coroot-api-key", serialized)
-        exec_call = next(
-            call for call in calls if call[:2] == ("exec", operational_guest.COROOT_CONTAINER_NAME)
-        )
+        exec_call = bounded_output.call_args.args[0]
+        self.assertEqual(["docker", "exec", operational_guest.COROOT_CONTAINER_NAME], exec_call[:3])
         self.assertIn("/usr/bin/curl", exec_call)
         self.assertIn("http://127.0.0.1:10300/metrics", exec_call)
-        self.assertIn("--max-filesize", exec_call)
-        self.assertEqual("2000000", exec_call[exec_call.index("--max-filesize") + 1])
         self.assertNotIn("172.17.0.2", " ".join(exec_call))
+        self.assertEqual(2_000_000, bounded_output.call_args.kwargs["output_limit"])
+        self.assertEqual(10, bounded_output.call_args.kwargs["timeout"])
         self.assertEqual(2, urlopen.call_count)
+
+    def test_bounded_command_output_caps_output_and_enforces_timeout(self) -> None:
+        oversized = operational_guest.bounded_command_output(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 4096)"],
+            output_limit=64,
+            timeout=2,
+        )
+        self.assertNotEqual(0, oversized.returncode)
+        self.assertEqual(65, len(oversized.stdout))
+
+        started = time.monotonic()
+        timed_out = operational_guest.bounded_command_output(
+            [sys.executable, "-c", "import time; time.sleep(2)"],
+            output_limit=64,
+            timeout=1,
+        )
+        self.assertNotEqual(0, timed_out.returncode)
+        self.assertLess(time.monotonic() - started, 1.8)
+
+    def test_coroot_metrics_probe_retries_failures_before_success(self) -> None:
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+        }
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+        attempts = [
+            subprocess.TimeoutExpired(["docker", "exec"], 10),
+            SimpleNamespace(returncode=1, stdout=b""),
+            SimpleNamespace(returncode=-9, stdout=b"x" * 2_000_001),
+            SimpleNamespace(returncode=0, stdout=b"metrics without marker\n"),
+            SimpleNamespace(returncode=0, stdout=b"node_agent_info 1\n"),
+        ]
+        with (
+            mock.patch.object(operational_guest, "docker", return_value=inspection),
+            mock.patch.object(operational_guest, "bounded_command_output", side_effect=attempts) as probe,
+            mock.patch.object(operational_guest.time, "sleep"),
+        ):
+            operational_guest.wait_coroot_node_agent("coroot-ephemeral-test-key-not-real")
+        self.assertEqual(5, probe.call_count)
+
+    def test_coroot_metrics_probe_fails_at_the_deadline(self) -> None:
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+        }
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+        with (
+            mock.patch.object(operational_guest, "docker", return_value=inspection),
+            mock.patch.object(
+                operational_guest,
+                "bounded_command_output",
+                return_value=SimpleNamespace(returncode=1, stdout=b""),
+            ),
+            mock.patch.object(operational_guest.time, "sleep"),
+            mock.patch.object(operational_guest.time, "monotonic", side_effect=[0, 0, 2]),
+        ):
+            with self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "namespace-local metrics endpoint is unavailable",
+            ):
+                operational_guest.wait_coroot_node_agent(
+                    "coroot-ephemeral-test-key-not-real",
+                    timeout=1,
+                )
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
