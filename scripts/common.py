@@ -83,8 +83,8 @@ def _bounded_request_worker(
             raw = response.read(max_response_bytes + 1)
             sender.send(("success", response.status, list(response.headers.items()), raw))
     except urllib.error.HTTPError as exc:
-        raw = exc.read(max_response_bytes + 1)
-        sender.send(("http", exc.code, [], raw))
+        exc.read(max_response_bytes + 1)
+        sender.send(("http", exc.code, [], b""))
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
         sender.send(("transport", 0, [], str(detail)))
@@ -148,10 +148,9 @@ def bounded_request(
     require(isinstance(payload, bytes), "trusted endpoint request worker returned an invalid body")
     require(len(payload) <= max_response_bytes, "trusted endpoint response exceeded the size limit")
     if kind == "http":
-        detail = payload.decode("utf-8", errors="replace")
         raise HttpRequestError(
             status,
-            f"HTTP {status} from trusted endpoint: {redact(detail)}",
+            f"HTTP {status} from trusted endpoint",
         )
     require(kind == "success", "trusted endpoint request worker returned an invalid result")
     return status, dict(response_headers), payload
@@ -365,8 +364,8 @@ def request_bytes(
             status = response.status
             response_headers = dict(response.headers.items())
     except urllib.error.HTTPError as exc:
-        detail = exc.read(16_384).decode("utf-8", errors="replace")
-        raise ContractError(f"HTTP {exc.code} from source broker: {redact(detail)}") from exc
+        exc.read(16_384)
+        raise ContractError(f"HTTP {exc.code} from source broker") from exc
     except urllib.error.URLError as exc:
         raise ContractError(f"source broker request failed: {exc.reason}") from exc
     require(status in expected, f"source broker returned unexpected HTTP {status}")
@@ -375,6 +374,7 @@ def request_bytes(
 
 def redact(value: str) -> str:
     patterns = (
+        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+",
         r"(?i)(authorization|token|secret|password|client_secret)[\s\"':=]+[^\s\",}]+",
         r"gh[pousr]_[A-Za-z0-9_]{20,}",
         r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",

@@ -106,6 +106,29 @@ def start_slow_drip_server(body: bytes, delay_seconds: float) -> tuple:
     return server, thread, SlowDripHandler
 
 
+def start_reflecting_error_server() -> tuple:
+    class ReflectingErrorHandler(http.server.BaseHTTPRequestHandler):
+        def _respond(self) -> None:
+            reflected = self.headers.get("Authorization", "missing").encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(reflected)))
+            self.end_headers()
+            self.wfile.write(reflected)
+
+        do_GET = _respond
+        do_POST = _respond
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReflectingErrorHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
 def seed_data() -> dict:
     return {
         "users": [
@@ -392,6 +415,38 @@ class OperationalContractTests(unittest.TestCase):
         for status, retryable in expected.items():
             with self.subTest(status=status):
                 self.assertEqual(retryable, common.OidcHttpRequestError(status, "test").retryable)
+
+    def test_reflected_bearer_credentials_never_reach_manager_or_oidc_errors(self) -> None:
+        opaque_token = "opaque-credential-value-that-must-not-escape"
+        server, thread = start_reflecting_error_server()
+        try:
+            with self.assertRaises(common.HttpRequestError) as manager_error:
+                common.request_json(
+                    "GET",
+                    f"http://127.0.0.1:{server.server_port}/manager",
+                    bearer=opaque_token,
+                    timeout=2.0,
+                )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ACTIONS_ID_TOKEN_REQUEST_URL": f"http://127.0.0.1:{server.server_port}/oidc",
+                        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": opaque_token,
+                    },
+                    clear=True,
+                ),
+                self.assertRaises(common.OidcHttpRequestError) as oidc_error,
+            ):
+                common.oidc_token("test-audience", timeout=2.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertNotIn(opaque_token, str(manager_error.exception))
+        self.assertNotIn(opaque_token, str(oidc_error.exception))
+        self.assertEqual("[REDACTED]", common.redact(f"Bearer {opaque_token}"))
 
     def test_deployment_lock_is_canonical_and_covers_exact_service_set(self) -> None:
         config = operational_config()
