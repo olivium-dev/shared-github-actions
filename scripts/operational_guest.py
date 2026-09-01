@@ -123,6 +123,15 @@ def require(condition: bool, message: str) -> None:
         raise DeployError(message)
 
 
+def contains_forbidden_endpoint(text: str, forbidden: str) -> bool:
+    try:
+        ipaddress.ip_address(forbidden)
+    except ValueError:
+        return forbidden in text
+    boundary = rf"(?<![A-Za-z0-9_.-]){re.escape(forbidden)}(?![A-Za-z0-9_.-])"
+    return re.search(boundary, text) is not None
+
+
 def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
@@ -558,7 +567,10 @@ def transformed_environment(
 
     serialized = "\n".join(f"{key}={value}" for key, value in sorted(environment.items()))
     for forbidden in FORBIDDEN:
-        require(forbidden not in serialized, f"{service_id} still references forbidden endpoint {forbidden}")
+        require(
+            not contains_forbidden_endpoint(serialized, forbidden),
+            f"{service_id} still references forbidden endpoint {forbidden}",
+        )
     return environment
 
 
