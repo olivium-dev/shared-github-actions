@@ -349,6 +349,8 @@ class OperationalContractTests(unittest.TestCase):
                 if sum(1 for call in calls if call[:2] == ("container", "inspect")) == 1:
                     return completed
                 return SimpleNamespace(returncode=0, stdout=json.dumps([running]).encode(), stderr=b"")
+            if arguments[:2] == ("exec", operational_guest.COROOT_CONTAINER_NAME):
+                return SimpleNamespace(returncode=0, stdout=b"node_agent_info 1\n", stderr=b"")
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
         with tempfile.TemporaryDirectory() as temporary_name:
@@ -380,70 +382,15 @@ class OperationalContractTests(unittest.TestCase):
         self.assertNotIn(api_key, serialized)
         self.assertNotIn("--publish", run_call)
         self.assertIn("/run/secrets/coroot-api-key", serialized)
-
-    def test_coroot_agent_address_supports_modern_and_legacy_inspect_shapes(self) -> None:
-        self.assertEqual(
-            "172.17.0.2",
-            operational_guest.coroot_agent_address(
-                {"NetworkSettings": {"IPAddress": "172.17.0.2"}}
-            ),
+        exec_call = next(
+            call for call in calls if call[:2] == ("exec", operational_guest.COROOT_CONTAINER_NAME)
         )
-        self.assertEqual(
-            "172.17.0.3",
-            operational_guest.coroot_agent_address(
-                {
-                    "NetworkSettings": {
-                        "IPAddress": "172.17.0.99",
-                        "Networks": {
-                            "bridge": {"IPAddress": "172.17.0.3"},
-                            "secondary": {"IPAddress": "172.18.0.3"},
-                        }
-                    }
-                }
-            ),
-        )
-        self.assertEqual(
-            "172.19.0.4",
-            operational_guest.coroot_agent_address(
-                {
-                    "NetworkSettings": {
-                        "Networks": {"lease-network": {"IPAddress": "172.19.0.4"}}
-                    }
-                }
-            ),
-        )
-
-        invalid = {
-            "missing": {},
-            "malformed": {"NetworkSettings": {"Networks": []}},
-            "empty": {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": ""}}}},
-            "malformed-address": {
-                "NetworkSettings": {
-                    "Networks": {"bridge": {"IPAddress": "not-an-ip"}}
-                }
-            },
-            "public-address": {
-                "NetworkSettings": {
-                    "Networks": {"bridge": {"IPAddress": "8.8.8.8"}}
-                }
-            },
-            "ambiguous": {
-                "NetworkSettings": {
-                    "Networks": {
-                        "first": {"IPAddress": "172.20.0.2"},
-                        "second": {"IPAddress": "172.21.0.2"},
-                    }
-                }
-            },
-        }
-        for label, inspect_row in invalid.items():
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(
-                    operational_guest.DeployError,
-                    "network inspection|unambiguous private container address|"
-                    "private container address is invalid|must be private IPv4",
-                ):
-                    operational_guest.coroot_agent_address(inspect_row)
+        self.assertIn("/usr/bin/curl", exec_call)
+        self.assertIn("http://127.0.0.1:10300/metrics", exec_call)
+        self.assertIn("--max-filesize", exec_call)
+        self.assertEqual("2000000", exec_call[exec_call.index("--max-filesize") + 1])
+        self.assertNotIn("172.17.0.2", " ".join(exec_call))
+        self.assertEqual(2, urlopen.call_count)
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
