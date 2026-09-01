@@ -292,6 +292,12 @@ def ssh_options(cloudflared: Path, private_key: Path, known_hosts: Path) -> list
         "HostKeyAlgorithms=ssh-ed25519",
         "-o",
         "ConnectTimeout=30",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=12",
+        "-o",
+        "TCPKeepAlive=yes",
         "-i",
         str(private_key),
     ]
