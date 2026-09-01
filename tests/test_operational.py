@@ -1174,6 +1174,7 @@ class OperationalContractTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertEqual("production", environment["ENVIRONMENT"])
         self.assertEqual("0", environment["WHISPER_FAKE_TRANSCRIBE"])
+        self.assertEqual("0", environment["DURABLE_TRANSCRIPTION_ENABLED"])
         self.assertEqual(
             "/run/secrets/openai-ephemeral-sandbox-api-key",
             environment["OPENAI_API_KEY_FILE"],
@@ -1211,6 +1212,7 @@ class OperationalContractTests(unittest.TestCase):
             gateway_routes=[],
         )
         self.assertEqual("1", fake_environment["WHISPER_FAKE_TRANSCRIBE"])
+        self.assertEqual("0", fake_environment["DURABLE_TRANSCRIPTION_ENABLED"])
         self.assertNotIn("OPENAI_API_KEY", fake_environment)
         self.assertNotIn("OPENAI_API_KEY_FILE", fake_environment)
 

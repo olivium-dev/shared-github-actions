@@ -572,6 +572,7 @@ def transformed_environment(
 
     if service_id == "voice-transcription-service":
         environment.pop("OPENAI_API_KEY", None)
+        environment["DURABLE_TRANSCRIPTION_ENABLED"] = "0"
         if openai_api_key:
             environment["ENVIRONMENT"] = "production"
             environment["OPENAI_API_KEY_FILE"] = "/run/secrets/openai-ephemeral-sandbox-api-key"
