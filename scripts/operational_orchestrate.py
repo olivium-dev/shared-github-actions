@@ -47,7 +47,7 @@ class Heartbeat:
     def transition(self, phase: str) -> dict[str, Any]:
         with self._lock:
             self._raise_if_failed()
-            self.lease = self.client.progress(self.lease, phase)
+            self.lease = self._progress_with_recovery(phase)
             self.phase = phase
             return dict(self.lease)
 
@@ -70,12 +70,43 @@ class Heartbeat:
         while not self._stop.wait(self.interval_seconds):
             try:
                 with self._lock:
-                    self.lease = self.client.progress(self.lease, self.phase)
+                    self.lease = self._progress_with_recovery(self.phase)
             except Exception as exc:
                 with self._lock:
                     self._error = exc
                 self._stop.set()
                 return
+
+    def _progress_with_recovery(self, phase: str) -> dict[str, Any]:
+        attempted = dict(self.lease)
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                return self.client.progress(attempted, phase)
+            except Exception as exc:
+                last_error = exc
+                current = self.client.lease(str(attempted["leaseId"]))
+                require(
+                    current.get("deploymentId") == attempted.get("deploymentId")
+                    and current.get("deploymentLockHash") == attempted.get("deploymentLockHash"),
+                    "manager heartbeat reconciliation changed lease identity",
+                )
+                require(
+                    current.get("state") not in {"cleanup_pending", "deleted"},
+                    f"manager lease entered {current.get('state')} during heartbeat reconciliation",
+                )
+                current_version = current.get("stateVersion")
+                attempted_version = attempted.get("stateVersion")
+                require(
+                    isinstance(current_version, int) and isinstance(attempted_version, int),
+                    "manager heartbeat reconciliation returned an invalid stateVersion",
+                )
+                if current.get("state") == phase and current_version > attempted_version:
+                    return current
+                attempted = current
+                if attempt < 2:
+                    time.sleep(attempt + 1)
+        raise ContractError(f"manager heartbeat failed after reconciliation: {last_error}")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -330,6 +361,93 @@ def transport(
     return result.stdout.decode(errors="strict").strip()
 
 
+def detached_guest_deploy(
+    *,
+    destination: str,
+    options: list[str],
+    remote_root: str,
+    lease_id: str,
+    command: str,
+    credentials: bytes,
+    timeout: int = 5400,
+) -> str:
+    credential_path = f"{remote_root}/guest-credentials.json"
+    output_path = f"{remote_root}/guest-output.log"
+    status_path = f"{remote_root}/guest-status"
+    unit = f"olivium-jeeb-deploy-{lease_id}"
+    credential_install = (
+        "umask 077; "
+        f"dd of={shlex.quote(credential_path)} status=none; "
+        f"chown root:root {shlex.quote(credential_path)}; "
+        f"chmod 0600 {shlex.quote(credential_path)}"
+    )
+    transport(
+        ["ssh", *options, destination, f"sudo /bin/bash -c {shlex.quote(credential_install)}"],
+        stdin=credentials,
+        timeout=900,
+    )
+    runner = (
+        "set -Eeuo pipefail; "
+        f"exec 3<{shlex.quote(credential_path)}; "
+        f"rm -f -- {shlex.quote(credential_path)}; "
+        "set +e; "
+        f"{command} <&3 >{shlex.quote(output_path)} 2>&1; "
+        "code=$?; set -e; "
+        f"printf '%s\\n' \"$code\" >{shlex.quote(status_path)}.tmp; "
+        f"mv -f -- {shlex.quote(status_path)}.tmp {shlex.quote(status_path)}; "
+        "exit \"$code\""
+    )
+    transport(
+        [
+            "ssh",
+            *options,
+            destination,
+            "sudo systemd-run --quiet "
+            f"--unit={shlex.quote(unit)} --property=Type=exec "
+            f"/bin/bash -c {shlex.quote(runner)}",
+        ],
+    )
+    poll = (
+        f"if sudo test -s {shlex.quote(status_path)}; then "
+        f"sudo cat {shlex.quote(status_path)}; "
+        f"elif sudo systemctl is-active --quiet {shlex.quote(unit)}; then "
+        "printf 'running\\n'; else printf 'missing\\n'; fi"
+    )
+    deadline = time.monotonic() + timeout
+    transient_failures = 0
+    try:
+        while time.monotonic() < deadline:
+            try:
+                state = transport(["ssh", *options, destination, poll], timeout=120)
+                transient_failures = 0
+            except ContractError as exc:
+                if "Cloudflare SSH operation failed" not in str(exc):
+                    raise
+                transient_failures += 1
+                require(transient_failures <= 12, "Cloudflare SSH did not recover while polling guest deploy")
+                time.sleep(min(5 * transient_failures, 30))
+                continue
+            if state == "running":
+                time.sleep(10)
+                continue
+            require(state.isdigit(), f"detached guest deploy returned invalid state: {state}")
+            output = transport(
+                ["ssh", *options, destination, f"sudo cat {shlex.quote(output_path)}"],
+                timeout=300,
+            )
+            require(state == "0", f"guest deploy failed ({state}): {output[-3000:]}")
+            return output
+        raise ContractError("detached guest deploy did not finish before timeout")
+    finally:
+        try:
+            transport(
+                ["ssh", *options, destination, f"sudo rm -f -- {shlex.quote(credential_path)}"],
+                timeout=120,
+            )
+        except ContractError:
+            pass
+
+
 def upload_runtime(
     args: argparse.Namespace,
     lease: dict[str, Any],
@@ -415,7 +533,14 @@ def upload_runtime(
         f"--lock-sha256 {shlex.quote(lease['deploymentLockHash'])} "
         f"--zone {shlex.quote(lease['zone'])}"
     )
-    output = transport(["ssh", *options, destination, command], stdin=credentials, timeout=5400)
+    output = detached_guest_deploy(
+        destination=destination,
+        options=options,
+        remote_root=remote_root,
+        lease_id=lease["leaseId"],
+        command=command,
+        credentials=credentials,
+    )
     require(any(json.loads(line).get("ok") is True for line in output.splitlines() if line.startswith("{")), "guest deploy returned no success receipt")
 
 
