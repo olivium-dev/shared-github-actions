@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -783,7 +784,7 @@ class OperationalContractTests(unittest.TestCase):
             {"authToken": "one.two.three"},
             {"authToken": "four.five.six"},
             {"authToken": "seven.eight.nine"},
-            {"availableBalance": 100.0},
+            {"availableBalance": Decimal("100.0")},
             {"capabilities": ["admin.portal.access", "cms.config.read"]},
         ]
         with (
@@ -802,7 +803,55 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual("/v1/jeeb/wallet", gateway.call_args_list[-2].args[0])
         self.assertEqual("/admin/session", gateway.call_args_list[-1].args[0])
 
-    def test_guest_rejects_cross_currency_jeeber_wallet_total(self) -> None:
+    def test_guest_parser_rejects_cross_currency_total_above_binary_float_precision(self) -> None:
+        seed = seed_data()
+        seed["users"][1]["wallets"][0]["balance"] = "9007199254740992.00"
+        seed["users"][1]["wallets"][1]["balance"] = "1.00"
+        roster = {
+            "users": [
+                {
+                    "userId": user["id"],
+                    "name": user["username"],
+                    "role": operational_seed.roles_for(user["type"])[1],
+                    "roles": operational_seed.roles_for(user["type"])[0],
+                }
+                for user in seed["users"]
+            ]
+        }
+        raw_responses = [
+            json.dumps(roster).encode(),
+            b'{"authToken":"one.two.three"}',
+            b'{"authToken":"four.five.six"}',
+            b'{"authToken":"seven.eight.nine"}',
+            b'{"availableBalance":9007199254740993.00}',
+        ]
+
+        responses = []
+        for body in raw_responses:
+            response = mock.MagicMock()
+            response.__enter__.return_value.status = 200
+            response.__enter__.return_value.read.return_value = body
+            responses.append(response)
+
+        with (
+            mock.patch.object(
+                operational_guest.urllib.request,
+                "urlopen",
+                side_effect=responses,
+            ),
+            mock.patch.object(
+                operational_guest,
+                "service_environment",
+                return_value={"SuperAdmin__PassCode": "not-printed"},
+            ),
+            self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "Jeeber public wallet balance does not match seed data",
+            ),
+        ):
+            operational_guest.validate_seed_gateway({"seedData": seed}, "jeeb-eph-test")
+
+    def test_guest_rejects_inexact_wallet_balance_shapes(self) -> None:
         seed = seed_data()
         roster = {
             "users": [
@@ -815,26 +864,28 @@ class OperationalContractTests(unittest.TestCase):
                 for user in seed["users"]
             ]
         }
-        responses = [
-            roster,
-            {"authToken": "one.two.three"},
-            {"authToken": "four.five.six"},
-            {"authToken": "seven.eight.nine"},
-            {"availableBalance": 112.75},
-        ]
-        with (
-            mock.patch.object(operational_guest, "gateway_json", side_effect=responses),
-            mock.patch.object(
-                operational_guest,
-                "service_environment",
-                return_value={"SuperAdmin__PassCode": "not-printed"},
-            ),
-            self.assertRaisesRegex(
-                operational_guest.DeployError,
-                "Jeeber public wallet balance does not match seed data",
-            ),
-        ):
-            operational_guest.validate_seed_gateway({"seedData": seed}, "jeeb-eph-test")
+        for invalid_balance in (100.0, "100.0", True):
+            responses = [
+                roster,
+                {"authToken": "one.two.three"},
+                {"authToken": "four.five.six"},
+                {"authToken": "seven.eight.nine"},
+                {"availableBalance": invalid_balance},
+            ]
+            with (
+                self.subTest(balance=repr(invalid_balance)),
+                mock.patch.object(operational_guest, "gateway_json", side_effect=responses),
+                mock.patch.object(
+                    operational_guest,
+                    "service_environment",
+                    return_value={"SuperAdmin__PassCode": "not-printed"},
+                ),
+                self.assertRaisesRegex(
+                    operational_guest.DeployError,
+                    "availableBalance must be an exact JSON number",
+                ),
+            ):
+                operational_guest.validate_seed_gateway({"seedData": seed}, "jeeb-eph-test")
 
     def test_environment_rewrites_stage_dependencies_to_the_lease(self) -> None:
         service = {

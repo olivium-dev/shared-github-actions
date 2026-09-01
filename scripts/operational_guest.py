@@ -1154,6 +1154,10 @@ def service_environment(service_name: str) -> dict[str, str]:
     return environment
 
 
+def reject_nonfinite_json_number(value: str) -> None:
+    raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
+
 def gateway_json(path: str, *, payload: dict[str, Any] | None = None, token: str | None = None) -> Any:
     headers = {"Accept": "application/json", "User-Agent": "olivium-jeeb-seed-validator/1"}
     data = None
@@ -1173,11 +1177,15 @@ def gateway_json(path: str, *, payload: dict[str, Any] | None = None, token: str
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             require(200 <= response.status < 300, f"gateway seed validation failed for {path}")
-            return json.loads(response.read())
+            return json.loads(
+                response.read(),
+                parse_float=Decimal,
+                parse_constant=reject_nonfinite_json_number,
+            )
     except urllib.error.HTTPError as exc:
         exc.read()
         raise DeployError(f"gateway seed validation failed for {path} (status {exc.code})") from exc
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
         raise DeployError(f"gateway seed validation failed for {path}") from exc
 
 
@@ -1212,6 +1220,13 @@ def validate_seed_gateway(config: dict[str, Any], prefix: str) -> None:
     for jeeber in (user for user in seed_data["users"] if user["type"] == "jeeber"):
         wallet = gateway_json("/v1/jeeb/wallet", token=login_tokens[jeeber["id"]])
         require(isinstance(wallet, dict) and "availableBalance" in wallet, "Jeeber wallet response is invalid")
+        actual_balance = wallet["availableBalance"]
+        require(
+            type(actual_balance) is int or isinstance(actual_balance, Decimal),
+            "Jeeber wallet availableBalance must be an exact JSON number",
+        )
+        actual_balance = Decimal(actual_balance) if type(actual_balance) is int else actual_balance
+        require(actual_balance.is_finite(), "Jeeber wallet availableBalance must be finite")
         expected_balance = sum(
             (
                 Decimal(seed_wallet["balance"])
@@ -1221,7 +1236,7 @@ def validate_seed_gateway(config: dict[str, Any], prefix: str) -> None:
             Decimal("0"),
         )
         require(
-            Decimal(str(wallet["availableBalance"])) == expected_balance,
+            actual_balance == expected_balance,
             f"Jeeber public wallet balance does not match seed data for {jeeber['id']}",
         )
 
