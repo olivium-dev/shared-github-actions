@@ -141,8 +141,13 @@ class OperationalContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("super_login_passcode:\n        required: true", workflow)
+        self.assertIn("openai_api_key:\n        required: true", workflow)
         self.assertIn(
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}",
+            workflow,
+        )
+        self.assertIn(
+            "JEEB_EPHEMERAL_OPENAI_API_KEY: ${{ secrets.openai_api_key }}",
             workflow,
         )
 
@@ -151,10 +156,16 @@ class OperationalContractTests(unittest.TestCase):
             "JEEB_EPHEMERAL_GHCR_TOKEN": "token-that-is-long-enough",
             "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
+            "JEEB_EPHEMERAL_OPENAI_API_KEY": "sk-ephemeral-test-key-not-real",
         }
         with mock.patch.dict(os.environ, valid, clear=True):
             self.assertEqual(
-                (valid["JEEB_EPHEMERAL_GHCR_TOKEN"], valid["JEEB_EPHEMERAL_STAGE_TEMPLATE_B64"], valid["JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE"]),
+                (
+                    valid["JEEB_EPHEMERAL_GHCR_TOKEN"],
+                    valid["JEEB_EPHEMERAL_STAGE_TEMPLATE_B64"],
+                    valid["JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE"],
+                    valid["JEEB_EPHEMERAL_OPENAI_API_KEY"],
+                ),
                 operational_orchestrate.protected_deployment_credentials(),
             )
         invalid = {**valid, "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": ""}
@@ -282,6 +293,7 @@ class OperationalContractTests(unittest.TestCase):
                         "JEEB_EPHEMERAL_GHCR_TOKEN": "token-that-is-long-enough",
                         "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
                         "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
+                        "JEEB_EPHEMERAL_OPENAI_API_KEY": "sk-ephemeral-test-key-not-real",
                         "GITHUB_ACTOR": "tester",
                     },
                 ),
@@ -304,6 +316,7 @@ class OperationalContractTests(unittest.TestCase):
             self.assertIn("operational_guest.py", install)
             self.assertIn("operational_seed.py", install)
             self.assertEqual("ephemeral-only-passcode", guest_credentials["superLoginPasscode"])
+            self.assertEqual("sk-ephemeral-test-key-not-real", guest_credentials["openAiApiKey"])
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
@@ -548,6 +561,7 @@ class OperationalContractTests(unittest.TestCase):
                 postgres_password="postgres-password",
                 mongo_password="mongo-password",
                 super_login_passcode="ephemeral-only-passcode",
+                openai_api_key="sk-ephemeral-test-key-not-real",
                 public_hostname="eph-bright-pikachu-42.fds-8.space",
                 private_ip="192.168.2.160",
                 probe_config="jeeb-eph-test-http-health-probe",
@@ -681,6 +695,7 @@ class OperationalContractTests(unittest.TestCase):
                 deployment_id="jeeb-gh-1-1",
                 service_id="jeeb-state-service",
                 postgres_password="postgres-password",
+                openai_api_key="sk-ephemeral-test-key-not-real",
             )
 
         self.assertEqual("64198", secrets[0]["uid"])
@@ -718,7 +733,55 @@ class OperationalContractTests(unittest.TestCase):
                     deployment_id="jeeb-gh-1-1",
                     service_id="jeeb-state-service",
                     postgres_password="postgres-password",
+                    openai_api_key="sk-ephemeral-test-key-not-real",
                 )
+
+    def test_voice_environment_and_secret_are_real_provider_file_backed(self) -> None:
+        service = {"id": "voice-transcription-service"}
+        template_service = {
+            "env": [
+                "OPENAI_API_KEY=must-not-survive",
+                "WHISPER_FAKE_TRANSCRIBE=1",
+            ]
+        }
+        environment = operational_guest.transformed_environment(
+            service,
+            template_service,
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-test.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertEqual("production", environment["ENVIRONMENT"])
+        self.assertEqual("0", environment["WHISPER_FAKE_TRANSCRIBE"])
+        self.assertEqual(
+            "/run/secrets/openai-ephemeral-sandbox-api-key",
+            environment["OPENAI_API_KEY_FILE"],
+        )
+
+        with (
+            mock.patch.object(operational_guest, "create_secret") as create_secret,
+            mock.patch.object(operational_guest, "create_config"),
+        ):
+            mounts, _ = operational_guest.materialize_mounts(
+                {"secrets": {}, "configs": {}},
+                {"secrets": [], "configs": []},
+                prefix="jeeb-eph-test",
+                lease_id="bright-pikachu-42",
+                lock_hash="a" * 64,
+                deployment_id="jeeb-gh-1-1",
+                service_id="voice-transcription-service",
+                postgres_password="postgres-password",
+                openai_api_key="sk-ephemeral-test-key-not-real",
+            )
+        create_secret.assert_called_once()
+        self.assertEqual("openai-ephemeral-sandbox-api-key", mounts[0]["target"])
+        self.assertEqual("65532", mounts[0]["uid"])
+        self.assertEqual("65532", mounts[0]["gid"])
+        self.assertEqual(0o400, mounts[0]["mode"])
 
     def test_guest_config_requires_exactly_the_catalog_services(self) -> None:
         config = operational_config()
