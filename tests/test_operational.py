@@ -353,6 +353,88 @@ class OperationalContractTests(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=yes", options)
         self.assertIn("HostKeyAlgorithms=ssh-ed25519", options)
 
+    def test_digest_pinned_image_pull_retries_transient_registry_reset(self) -> None:
+        image = f"ghcr.io/olivium-dev/voice-transcription-service@sha256:{'a' * 64}"
+        reset = SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=b"failed to copy: read: connection reset by peer",
+        )
+        succeeded = SimpleNamespace(returncode=0, stdout=b"pulled", stderr=b"")
+
+        with (
+            mock.patch.object(
+                operational_guest,
+                "docker",
+                side_effect=(reset, succeeded),
+            ) as docker,
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+        ):
+            operational_guest.pull_image(image)
+
+        self.assertEqual(2, docker.call_count)
+        docker.assert_called_with(
+            "pull", image, timeout=1800, capture=True, check=False
+        )
+        sleep.assert_called_once_with(2)
+
+    def test_image_pull_exhaustion_stays_red_and_redacts_signed_url(self) -> None:
+        image = f"ghcr.io/olivium-dev/voice-transcription-service@sha256:{'b' * 64}"
+        reset = SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=(
+                b'failed to copy: Get "https://registry.example.invalid/blob?sig=secret": '
+                b"read: connection reset by peer"
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                operational_guest,
+                "docker",
+                side_effect=[reset] * 5,
+            ) as docker,
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                operational_guest.DeployError,
+                r"after 5 attempt\(s\).*registry-url-redacted",
+            ) as failure,
+        ):
+            operational_guest.pull_image(image)
+
+        self.assertEqual(5, docker.call_count)
+        self.assertEqual(
+            [mock.call(delay) for delay in operational_guest.IMAGE_PULL_RETRY_DELAYS],
+            sleep.call_args_list,
+        )
+        self.assertNotIn("sig=secret", str(failure.exception))
+
+    def test_image_pull_does_not_retry_permanent_registry_rejection(self) -> None:
+        image = f"ghcr.io/olivium-dev/voice-transcription-service@sha256:{'c' * 64}"
+        rejected = SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=b"unauthorized: access to the requested resource is not authorized",
+        )
+
+        with (
+            mock.patch.object(
+                operational_guest,
+                "docker",
+                return_value=rejected,
+            ) as docker,
+            mock.patch.object(operational_guest.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                operational_guest.DeployError,
+                r"after 1 attempt\(s\).*unauthorized",
+            ),
+        ):
+            operational_guest.pull_image(image)
+
+        docker.assert_called_once()
+        sleep.assert_not_called()
+
     def test_coroot_agent_is_pinned_privileged_private_and_secret_file_backed(self) -> None:
         api_key = "coroot-ephemeral-test-key-not-real"
         completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")

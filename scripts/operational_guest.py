@@ -47,7 +47,20 @@ FORBIDDEN = (
     "cms.jeeb.fds-1.com",
 )
 IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
+PINNED_PULL_IMAGE_RE = re.compile(
+    r"^[a-z0-9][a-z0-9./_:-]+@sha256:[0-9a-f]{64}$"
+)
 SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+IMAGE_PULL_RETRY_DELAYS = (2, 5, 10, 20)
+TRANSIENT_IMAGE_PULL_ERRORS = (
+    "connection reset by peer",
+    "context deadline exceeded",
+    "i/o timeout",
+    "no such host",
+    "temporary failure in name resolution",
+    "tls handshake timeout",
+    "unexpected eof",
+)
 COROOT_NODE_AGENT_IMAGE = (
     "ghcr.io/coroot/coroot-node-agent:1.35.8@"
     "sha256:aa14e9ea552ccda55ca31fe7a7f03b0f743f00c20d9971537cd4a4d85f4146d7"
@@ -168,6 +181,35 @@ def run(
 
 def docker(*arguments: str, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
     return run(["docker", *arguments], **kwargs)
+
+
+def pull_image(image: str) -> None:
+    require(
+        PINNED_PULL_IMAGE_RE.fullmatch(image) is not None,
+        "image pull requires an immutable digest",
+    )
+    attempts = len(IMAGE_PULL_RETRY_DELAYS) + 1
+    repository = image.rsplit("@", 1)[0]
+    for attempt in range(1, attempts + 1):
+        result = docker("pull", image, timeout=1800, capture=True, check=False)
+        if result.returncode == 0:
+            return
+        raw_detail = b"\n".join(part for part in (result.stdout, result.stderr) if part)
+        detail = raw_detail.decode(errors="replace")[-4000:]
+        transient = any(fragment in detail.lower() for fragment in TRANSIENT_IMAGE_PULL_ERRORS)
+        if not transient or attempt == attempts:
+            sanitized = re.sub(r"https?://\S+", "[registry-url-redacted]", detail)[-2000:]
+            raise DeployError(
+                f"image pull failed for {repository} after {attempt} attempt(s): {sanitized}"
+            )
+        delay = IMAGE_PULL_RETRY_DELAYS[attempt - 1]
+        print(
+            f"Transient registry transport failure pulling {repository}; "
+            f"retrying in {delay}s ({attempt}/{attempts}).",
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(delay)
 
 
 def bounded_command_output(
@@ -751,7 +793,7 @@ def deploy_coroot_node_agent(
 
     volume = f"jeeb-eph-{lease_id}-coroot-agent-data"
     ensure_volume(volume, lease_id, lock_hash, deployment_id)
-    docker("pull", COROOT_NODE_AGENT_IMAGE, timeout=1800)
+    pull_image(COROOT_NODE_AGENT_IMAGE)
     entrypoint = (
         'api_key="$(cat /run/secrets/coroot-api-key)"; '
         'test -n "$api_key"; export API_KEY="$api_key"; unset api_key; '
@@ -815,7 +857,7 @@ def create_infrastructure(
 ) -> None:
     images = {item["id"]: item["image"] for item in config["infrastructure"]}
     for component in ("postgresql", "mongodb", "redis", "lease-local-registry"):
-        docker("pull", images[component], timeout=1800)
+        pull_image(images[component])
 
     postgres_volume = f"{prefix}-postgresql-data"
     mongo_volume = f"{prefix}-mongodb-data"
@@ -1628,7 +1670,7 @@ def deploy(args: argparse.Namespace) -> None:
     ordered.append(next(item for item in config["services"] if item["id"] == "jeeb-gateway"))
     for service in ordered:
         require(service["stagingName"] in template_by_name, f"template is missing {service['id']}")
-        docker("pull", service["image"], timeout=1800)
+        pull_image(service["image"])
         create_application(
             service,
             template,
@@ -1649,7 +1691,7 @@ def deploy(args: argparse.Namespace) -> None:
         )
 
     web_application = config["webApplications"][0]
-    docker("pull", web_application["image"], timeout=1800)
+    pull_image(web_application["image"])
     create_web_application(
         web_application,
         prefix=prefix,
