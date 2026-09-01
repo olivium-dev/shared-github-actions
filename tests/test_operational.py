@@ -344,7 +344,11 @@ class OperationalContractTests(unittest.TestCase):
         api_key = "coroot-ephemeral-test-key-not-real"
         completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
         running = {
-            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "Config": {
+                "Image": operational_guest.COROOT_NODE_AGENT_IMAGE,
+                "Env": [],
+                "Cmd": ["-ec", 'export API_KEY="$api_key"'],
+            },
             "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
             "State": {"Running": True, "Status": "running"},
             "NetworkSettings": {"IPAddress": "172.17.0.2"},
@@ -391,6 +395,8 @@ class OperationalContractTests(unittest.TestCase):
         self.assertIn("--privileged", run_call)
         self.assertIn("host", run_call)
         self.assertNotIn(api_key, serialized)
+        self.assertIn('export API_KEY="$api_key"', serialized)
+        self.assertNotIn("COROOT_API_KEY", serialized)
         self.assertNotIn("--publish", run_call)
         self.assertIn("/run/secrets/coroot-api-key", serialized)
         exec_call = bounded_output.call_args.args[0]
@@ -401,6 +407,31 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(2_000_000, bounded_output.call_args.kwargs["output_limit"])
         self.assertEqual(10, bounded_output.call_args.kwargs["timeout"])
         self.assertEqual(2, urlopen.call_count)
+
+    def test_coroot_readiness_rejects_the_windows_only_api_key_environment(self) -> None:
+        running = {
+            "Config": {
+                "Image": operational_guest.COROOT_NODE_AGENT_IMAGE,
+                "Env": [],
+                "Cmd": ["-ec", 'export COROOT_API_KEY="$api_key"'],
+            },
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+        }
+        inspection = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([running]).encode(),
+            stderr=b"",
+        )
+
+        with mock.patch.object(operational_guest, "docker", return_value=inspection):
+            with self.assertRaisesRegex(
+                operational_guest.DeployError,
+                "documented Linux API key environment",
+            ):
+                operational_guest.wait_coroot_node_agent(
+                    "coroot-ephemeral-test-key-not-real"
+                )
 
     def test_bounded_command_output_caps_output_and_enforces_timeout(self) -> None:
         oversized = operational_guest.bounded_command_output(
@@ -422,7 +453,11 @@ class OperationalContractTests(unittest.TestCase):
 
     def test_coroot_metrics_probe_retries_failures_before_success(self) -> None:
         running = {
-            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "Config": {
+                "Image": operational_guest.COROOT_NODE_AGENT_IMAGE,
+                "Env": [],
+                "Cmd": ["-ec", 'export API_KEY="$api_key"'],
+            },
             "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
             "State": {"Running": True, "Status": "running"},
         }
@@ -448,7 +483,11 @@ class OperationalContractTests(unittest.TestCase):
 
     def test_coroot_metrics_probe_fails_at_the_deadline(self) -> None:
         running = {
-            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "Config": {
+                "Image": operational_guest.COROOT_NODE_AGENT_IMAGE,
+                "Env": [],
+                "Cmd": ["-ec", 'export API_KEY="$api_key"'],
+            },
             "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
             "State": {"Running": True, "Status": "running"},
         }
@@ -487,7 +526,11 @@ class OperationalContractTests(unittest.TestCase):
 
     def test_coroot_metrics_probe_clamps_each_operation_to_the_deadline(self) -> None:
         running = {
-            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "Config": {
+                "Image": operational_guest.COROOT_NODE_AGENT_IMAGE,
+                "Env": [],
+                "Cmd": ["-ec", 'export API_KEY="$api_key"'],
+            },
             "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
             "State": {"Running": True, "Status": "running"},
         }
