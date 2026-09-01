@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.server
 import io
 import ipaddress
 import json
@@ -9,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -25,6 +27,7 @@ import operational_guest  # noqa: E402
 import operational_orchestrate  # noqa: E402
 import operational_seed  # noqa: E402
 import manager_client  # noqa: E402
+import common  # noqa: E402
 
 
 SERVICE_IDS = (
@@ -66,6 +69,41 @@ def heartbeat_lease(*, deadline_seconds: float = 120.0, **updates: object) -> di
     }
     lease.update(updates)
     return lease
+
+
+def start_slow_drip_server(body: bytes, delay_seconds: float) -> tuple:
+    class SlowDripHandler(http.server.BaseHTTPRequestHandler):
+        get_count = 0
+        post_count = 0
+
+        def _respond(self) -> None:
+            if self.command == "GET":
+                type(self).get_count += 1
+            else:
+                type(self).post_count += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for value in body:
+                    self.wfile.write(bytes((value,)))
+                    self.wfile.flush()
+                    time.sleep(delay_seconds)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        do_GET = _respond
+        do_POST = _respond
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowDripHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, SlowDripHandler
 
 
 def seed_data() -> dict:
@@ -270,6 +308,90 @@ class OperationalContractTests(unittest.TestCase):
 
         token.assert_called_once_with(timeout_seconds=4.0)
         self.assertEqual(3.0, request.call_args.kwargs["timeout"])
+
+    def test_trusted_request_enforces_absolute_deadline_against_slow_drip(self) -> None:
+        server, thread, _ = start_slow_drip_server(b'{"ok":true,"padding":"' + b"x" * 100 + b'"}', 0.05)
+        started = time.monotonic()
+        elapsed = 0.0
+        try:
+            with self.assertRaisesRegex(common.TransientRequestError, "absolute deadline"):
+                common.request_json(
+                    "GET",
+                    f"http://127.0.0.1:{server.server_port}/manager",
+                    timeout=0.6,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertLess(elapsed, 0.75)
+
+    def test_trusted_request_worker_can_run_from_the_heartbeat_thread(self) -> None:
+        server, server_thread, _ = start_slow_drip_server(b'{"ok":true}', 0.0)
+        result: list[object] = []
+
+        def request_from_thread() -> None:
+            try:
+                result.append(
+                    common.request_json(
+                        "GET",
+                        f"http://127.0.0.1:{server.server_port}/manager",
+                        timeout=2.0,
+                    )[0]
+                )
+            except Exception as exc:  # pragma: no cover - assertion captures the type
+                result.append(exc)
+
+        request_thread = threading.Thread(target=request_from_thread)
+        try:
+            request_thread.start()
+            request_thread.join(timeout=3)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual([{"ok": True}], result)
+
+    def test_oidc_request_enforces_absolute_deadline_against_slow_drip(self) -> None:
+        server, thread, _ = start_slow_drip_server(b'{"value":"' + b"x" * 100 + b'"}', 0.05)
+        started = time.monotonic()
+        elapsed = 0.0
+        try:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ACTIONS_ID_TOKEN_REQUEST_URL": f"http://127.0.0.1:{server.server_port}/oidc",
+                        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "test-request-token",
+                    },
+                    clear=True,
+                ),
+                self.assertRaisesRegex(common.TransientRequestError, "absolute deadline"),
+            ):
+                common.oidc_token("test-audience", timeout=0.6)
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertLess(elapsed, 0.75)
+
+    def test_http_request_error_retryability_is_explicit(self) -> None:
+        expected = {400: False, 401: False, 403: False, 409: True, 429: True, 500: True, 503: True}
+        for status, retryable in expected.items():
+            with self.subTest(status=status):
+                self.assertEqual(retryable, common.HttpRequestError(status, "test").retryable)
+
+    def test_oidc_http_retryability_excludes_permanent_conflicts_and_auth_failures(self) -> None:
+        expected = {400: False, 401: False, 403: False, 409: False, 429: True, 500: True, 503: True}
+        for status, retryable in expected.items():
+            with self.subTest(status=status):
+                self.assertEqual(retryable, common.OidcHttpRequestError(status, "test").retryable)
 
     def test_deployment_lock_is_canonical_and_covers_exact_service_set(self) -> None:
         config = operational_config()
@@ -506,6 +628,82 @@ class OperationalContractTests(unittest.TestCase):
 
         client.progress_once_before.assert_called_once()
         client.lease_once_before.assert_not_called()
+
+    def test_heartbeat_does_not_reconcile_permanent_progress_http_errors(self) -> None:
+        lease = heartbeat_lease()
+        for status in (400, 401, 403):
+            with self.subTest(status=status):
+                client = mock.Mock()
+                client.progress_once_before.side_effect = operational_orchestrate.HttpRequestError(status, "rejected")
+                heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+                with self.assertRaises(operational_orchestrate.HttpRequestError):
+                    heartbeat.transition("deploying")
+
+                client.progress_once_before.assert_called_once()
+                client.lease_once_before.assert_not_called()
+
+    def test_heartbeat_reconciles_only_explicitly_retryable_http_errors(self) -> None:
+        lease = heartbeat_lease()
+        refreshed = {**lease, "stateVersion": 5}
+        for status in (409, 429, 500, 503):
+            with self.subTest(status=status):
+                client = mock.Mock()
+                client.progress_once_before.side_effect = operational_orchestrate.HttpRequestError(status, "retryable")
+                client.lease_once_before.return_value = refreshed
+                heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+                self.assertEqual(5, heartbeat.transition("deploying")["stateVersion"])
+
+                client.progress_once_before.assert_called_once()
+                client.lease_once_before.assert_called_once()
+
+    def test_heartbeat_never_reposts_after_permanent_reconciliation_http_error(self) -> None:
+        lease = heartbeat_lease()
+        for status in (400, 401, 403):
+            with self.subTest(status=status):
+                client = mock.Mock()
+                client.progress_once_before.side_effect = operational_orchestrate.TransientRequestError("response lost")
+                client.lease_once_before.side_effect = operational_orchestrate.HttpRequestError(status, "rejected")
+                heartbeat = operational_orchestrate.Heartbeat(client, lease)
+
+                with self.assertRaises(operational_orchestrate.HttpRequestError):
+                    heartbeat.transition("deploying")
+
+                client.progress_once_before.assert_called_once()
+                client.lease_once_before.assert_called_once()
+
+    def test_heartbeat_slow_drip_timeout_cannot_trigger_a_second_post(self) -> None:
+        body = b'{"state":"deploying","stateVersion":5,"padding":"' + b"x" * 100 + b'"}'
+        server, thread, handler = start_slow_drip_server(body, 0.05)
+        lease = heartbeat_lease()
+        client = manager_client.ManagerClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            audience="test-audience",
+            expected_workflow_ref="workflow-ref",
+            expected_workflow_sha="a" * 40,
+            expected_environment="test",
+            allow_http_for_tests=True,
+        )
+        heartbeat = operational_orchestrate.Heartbeat(client, lease)
+        started = time.monotonic()
+        elapsed = 0.0
+        try:
+            with (
+                mock.patch.object(client, "fresh_token", return_value="token"),
+                mock.patch.object(operational_orchestrate, "HEARTBEAT_OPERATION_BUDGET_SECONDS", 0.6),
+                self.assertRaisesRegex(operational_orchestrate.ContractError, "deadline exhausted"),
+            ):
+                heartbeat.transition("deploying")
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(1, handler.post_count)
+        self.assertEqual(0, handler.get_count)
 
     def test_heartbeat_recovery_stops_before_manager_deadline(self) -> None:
         wall_now = datetime(2026, 9, 1, tzinfo=timezone.utc)

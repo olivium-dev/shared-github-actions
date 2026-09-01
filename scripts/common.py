@@ -6,11 +6,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import ssl
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,6 +54,107 @@ class HttpRequestError(ContractError):
     @property
     def retryable(self) -> bool:
         return self.status == 409 or self.status == 429 or self.status >= 500
+
+
+class OidcHttpRequestError(HttpRequestError):
+    """Raised for an OIDC endpoint status with OIDC-specific retry rules."""
+
+    @property
+    def retryable(self) -> bool:
+        return self.status == 429 or self.status >= 500
+
+
+def _bounded_request_worker(
+    sender: Any,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    data: bytes | None,
+    socket_timeout: float,
+    max_response_bytes: int,
+) -> None:
+    request = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=socket_timeout,
+            context=ssl.create_default_context(),
+        ) as response:
+            raw = response.read(max_response_bytes + 1)
+            sender.send(("success", response.status, list(response.headers.items()), raw))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(max_response_bytes + 1)
+        sender.send(("http", exc.code, [], raw))
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        sender.send(("transport", 0, [], str(detail)))
+    except Exception as exc:  # pragma: no cover - defensive isolation boundary
+        sender.send(("transport", 0, [], type(exc).__name__))
+    finally:
+        sender.close()
+
+
+def _terminate_request_worker(process: Any) -> None:
+    if not process.is_alive():
+        process.join()
+        return
+    process.terminate()
+    process.join(timeout=0.1)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def bounded_request(
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    data: bytes | None,
+    timeout: float,
+    max_response_bytes: int,
+) -> tuple[int, Mapping[str, str], bytes]:
+    require(timeout > 0.05, "trusted endpoint request deadline exhausted")
+    require(0 < max_response_bytes <= 4_194_304, "trusted endpoint response limit is invalid")
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_bounded_request_worker,
+        args=(sender, method, url, headers, data, timeout, max_response_bytes),
+        daemon=True,
+    )
+    deadline = time.monotonic() + timeout
+    termination_grace = min(0.1, timeout / 4)
+    started = False
+    try:
+        process.start()
+        started = True
+        sender.close()
+        remaining = deadline - time.monotonic() - termination_grace
+        if remaining <= 0 or not receiver.poll(remaining):
+            raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
+        try:
+            kind, status, response_headers, payload = receiver.recv()
+        except EOFError as exc:
+            raise TransientRequestError("trusted endpoint request worker exited without a response") from exc
+    finally:
+        sender.close()
+        receiver.close()
+        if started:
+            _terminate_request_worker(process)
+
+    if kind == "transport":
+        raise TransientRequestError(f"trusted endpoint request failed: {redact(str(payload))}")
+    require(isinstance(payload, bytes), "trusted endpoint request worker returned an invalid body")
+    require(len(payload) <= max_response_bytes, "trusted endpoint response exceeded the size limit")
+    if kind == "http":
+        detail = payload.decode("utf-8", errors="replace")
+        raise HttpRequestError(
+            status,
+            f"HTTP {status} from trusted endpoint: {redact(detail)}",
+        )
+    require(kind == "success", "trusted endpoint request worker returned an invalid result")
+    return status, dict(response_headers), payload
 
 
 def require(condition: bool, message: str) -> None:
@@ -181,15 +284,25 @@ def oidc_token(audience: str, *, static_env: str | None = None, timeout: float =
     require(bool(request_url and request_token), "GitHub OIDC request variables are unavailable")
     separator = "&" if "?" in request_url else "?"
     url = f"{request_url}{separator}{urllib.parse.urlencode({'audience': audience})}"
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {request_token}", "Accept": "application/json"},
-    )
+    request_headers = {"Authorization": f"Bearer {request_token}", "Accept": "application/json"}
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
-            payload = json.load(response)
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise TransientRequestError(f"GitHub OIDC token request failed: {exc}") from exc
+        status, _, raw = bounded_request(
+            "GET",
+            url,
+            headers=request_headers,
+            data=None,
+            timeout=timeout,
+            max_response_bytes=65_536,
+        )
+        require(status == 200, f"GitHub OIDC endpoint returned unexpected HTTP {status}")
+        payload = json.loads(raw)
+    except HttpRequestError as exc:
+        raise OidcHttpRequestError(
+            exc.status,
+            f"GitHub OIDC token request failed: {exc}",
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ContractError("GitHub OIDC response is invalid JSON") from exc
     require(isinstance(payload, dict) and isinstance(payload.get("value"), str), "GitHub OIDC response is invalid")
     return payload["value"]
 
@@ -210,22 +323,14 @@ def request_json(
     if body is not None:
         data = canonical_json(body)
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
-            raw = response.read()
-            status = response.status
-            response_headers = dict(response.headers.items())
-    except urllib.error.HTTPError as exc:
-        raw = exc.read(16_384)
-        detail = raw.decode("utf-8", errors="replace")
-        raise HttpRequestError(
-            exc.code,
-            f"HTTP {exc.code} from trusted endpoint: {redact(detail)}",
-        ) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        detail = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-        raise TransientRequestError(f"trusted endpoint request failed: {detail}") from exc
+    status, response_headers, raw = bounded_request(
+        method,
+        url,
+        headers=headers,
+        data=data,
+        timeout=timeout,
+        max_response_bytes=1_048_576,
+    )
     require(status in expected, f"trusted endpoint returned unexpected HTTP {status}")
     try:
         payload = json.loads(raw) if raw else None
