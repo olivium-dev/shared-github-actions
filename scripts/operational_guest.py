@@ -456,7 +456,10 @@ def transformed_environment(
         environment.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
     if service_id == "voice-transcription-service":
-        environment["WHISPER_FAKE_TRANSCRIBE"] = "1"
+        environment.pop("OPENAI_API_KEY", None)
+        environment["ENVIRONMENT"] = "production"
+        environment["OPENAI_API_KEY_FILE"] = "/run/secrets/openai-ephemeral-sandbox-api-key"
+        environment["WHISPER_FAKE_TRANSCRIBE"] = "0"
 
     if service_id == "realtime-comunication-service":
         environment["PHX_HOST"] = public_hostname
@@ -967,6 +970,7 @@ def materialize_mounts(
     deployment_id: str,
     service_id: str,
     postgres_password: str,
+    openai_api_key: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     secret_mounts: list[dict[str, Any]] = []
     for index, mount in enumerate(template_service.get("secrets", [])):
@@ -986,6 +990,20 @@ def materialize_mounts(
                 "uid": mount_owner(mount.get("uid"), service_id=service_id, field="secret UID"),
                 "gid": mount_owner(mount.get("gid"), service_id=service_id, field="secret GID"),
                 "mode": int(mount["mode"]),
+            }
+        )
+
+    if service_id == "voice-transcription-service":
+        require(openai_api_key, "ephemeral OpenAI credential is unavailable")
+        name = f"{prefix}-voice-transcription-service-openai"
+        create_secret(name, openai_api_key.encode(), lease_id, lock_hash, deployment_id)
+        secret_mounts.append(
+            {
+                "name": name,
+                "target": "openai-ephemeral-sandbox-api-key",
+                "uid": "65532",
+                "gid": "65532",
+                "mode": 0o400,
             }
         )
 
@@ -1024,6 +1042,7 @@ def create_application(
     postgres_password: str,
     mongo_password: str,
     super_login_passcode: str,
+    openai_api_key: str,
     public_hostname: str,
     private_ip: str,
     probe_config: str,
@@ -1050,6 +1069,7 @@ def create_application(
         deployment_id=deployment_id,
         service_id=service_id,
         postgres_password=postgres_password,
+        openai_api_key=openai_api_key,
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="jeeb-env-", delete=False) as handle:
         for key, value in sorted(environment.items()):
@@ -1238,6 +1258,7 @@ def deploy(args: argparse.Namespace) -> None:
     actor = credentials.get("ghcrActor")
     token = credentials.get("ghcrToken")
     super_login_passcode = credentials.get("superLoginPasscode")
+    openai_api_key = credentials.get("openAiApiKey")
     require(isinstance(actor, str) and actor and isinstance(token, str) and len(token) >= 20, "GHCR credentials missing")
     require(
         isinstance(super_login_passcode, str)
@@ -1245,6 +1266,14 @@ def deploy(args: argparse.Namespace) -> None:
         and super_login_passcode == super_login_passcode.strip()
         and super_login_passcode.isprintable(),
         "ephemeral super-login passcode missing",
+    )
+    require(
+        isinstance(openai_api_key, str)
+        and 20 <= len(openai_api_key) <= 4096
+        and openai_api_key == openai_api_key.strip()
+        and openai_api_key.isprintable()
+        and not any(character.isspace() for character in openai_api_key),
+        "ephemeral OpenAI credential missing",
     )
     docker("login", "ghcr.io", "-u", actor, "--password-stdin", stdin=token.encode())
 
@@ -1297,6 +1326,7 @@ def deploy(args: argparse.Namespace) -> None:
             postgres_password=postgres_password,
             mongo_password=mongo_password,
             super_login_passcode=super_login_passcode,
+            openai_api_key=openai_api_key,
             public_hostname=public_hostname,
             private_ip=str(private_ip),
             probe_config=probe_config,

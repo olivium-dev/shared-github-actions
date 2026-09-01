@@ -91,10 +91,11 @@ def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def protected_deployment_credentials() -> tuple[str, str, str]:
+def protected_deployment_credentials() -> tuple[str, str, str, str]:
     ghcr_token = os.environ.get("JEEB_EPHEMERAL_GHCR_TOKEN", "")
     stage_template = os.environ.get("JEEB_EPHEMERAL_STAGE_TEMPLATE_B64", "")
     super_login_passcode = os.environ.get("JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE", "")
+    openai_api_key = os.environ.get("JEEB_EPHEMERAL_OPENAI_API_KEY", "")
     require(len(ghcr_token) >= 20 and len(stage_template) >= 100, "protected deployment secrets are unavailable")
     require(
         6 <= len(super_login_passcode) <= 128
@@ -102,7 +103,14 @@ def protected_deployment_credentials() -> tuple[str, str, str]:
         and super_login_passcode.isprintable(),
         "protected ephemeral super-login passcode is unavailable",
     )
-    return ghcr_token, stage_template, super_login_passcode
+    require(
+        20 <= len(openai_api_key) <= 4096
+        and openai_api_key == openai_api_key.strip()
+        and openai_api_key.isprintable()
+        and not any(character.isspace() for character in openai_api_key),
+        "protected ephemeral OpenAI credential is unavailable",
+    )
+    return ghcr_token, stage_template, super_login_passcode, openai_api_key
 
 
 def validate_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], int, str]:
@@ -356,12 +364,13 @@ def upload_runtime(
         f"{shlex.quote(remote_root + '/http-health-probe')}"
     )
     transport(["ssh", *options, destination, install_command])
-    ghcr_token, _, super_login_passcode = protected_deployment_credentials()
+    ghcr_token, _, super_login_passcode, openai_api_key = protected_deployment_credentials()
     credentials = canonical(
         {
             "ghcrActor": os.environ.get("GITHUB_ACTOR", ""),
             "ghcrToken": ghcr_token,
             "superLoginPasscode": super_login_passcode,
+            "openAiApiKey": openai_api_key,
         }
     )
     command = (
@@ -454,7 +463,7 @@ def save_state(path: Path, lease: dict[str, Any] | None, lock_hash: str) -> None
 
 def run_deployment(args: argparse.Namespace) -> None:
     config, catalog, ttl, zone = validate_inputs(args)
-    _, stage_template, _ = protected_deployment_credentials()
+    _, stage_template, _, _ = protected_deployment_credentials()
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
