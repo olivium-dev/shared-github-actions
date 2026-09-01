@@ -107,6 +107,58 @@ def start_slow_drip_server(body: bytes, delay_seconds: float, status: int = 200)
     return server, thread, SlowDripHandler
 
 
+def start_chunked_oversize_server() -> tuple:
+    class ChunkedHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for _ in range(64):
+                    chunk = b"x" * 4096
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ChunkedHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def start_oversized_header_server() -> tuple:
+    class OversizedHeaderHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            for index in range(64):
+                self.send_header(f"X-Oversized-{index}", "x" * 1024)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            try:
+                self.wfile.write(b"{}")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OversizedHeaderHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
 def start_reflecting_error_server() -> tuple:
     class ReflectingErrorHandler(http.server.BaseHTTPRequestHandler):
         def _respond(self) -> None:
@@ -468,20 +520,20 @@ class OperationalContractTests(unittest.TestCase):
         opaque_token = "opaque-process-secret-that-must-not-escape"
         body_secret = "opaque-body-secret-that-must-not-escape"
         server, server_thread, _ = start_slow_drip_server(b'{"ok":true}', 0.0)
-        original_run = common.subprocess.run
+        original_popen = common.subprocess.Popen
         captured: dict[str, object] = {}
 
-        def capture(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        def capture(argv: list[str], **kwargs: object) -> subprocess.Popen:
             config_path = Path(argv[-1])
             captured["argv"] = list(argv)
             captured["environment"] = dict(kwargs.get("env", {}))
             captured["config"] = config_path.read_text(encoding="utf-8")
             captured["config_mode"] = stat.S_IMODE(config_path.stat().st_mode)
             captured["directory_mode"] = stat.S_IMODE(config_path.parent.stat().st_mode)
-            return original_run(argv, **kwargs)
+            return original_popen(argv, **kwargs)
 
         try:
-            with mock.patch.object(common.subprocess, "run", side_effect=capture):
+            with mock.patch.object(common.subprocess, "Popen", side_effect=capture):
                 payload, _ = common.request_json(
                     "POST",
                     f"http://127.0.0.1:{server.server_port}/manager",
@@ -503,6 +555,44 @@ class OperationalContractTests(unittest.TestCase):
         self.assertNotIn(body_secret, captured["config"])
         self.assertEqual(0o600, captured["config_mode"])
         self.assertEqual(0o700, captured["directory_mode"])
+
+    def test_curl_transport_bounds_chunked_body_without_content_length(self) -> None:
+        server, server_thread = start_chunked_oversize_server()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(common.ContractError, "response exceeded the size limit"):
+                common.bounded_request(
+                    "GET",
+                    f"http://127.0.0.1:{server.server_port}/chunked",
+                    headers={"Accept": "application/json"},
+                    data=None,
+                    timeout=2.0,
+                    max_response_bytes=1024,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+        self.assertLess(elapsed, 1.0)
+
+    def test_curl_transport_bounds_response_headers_before_parsing(self) -> None:
+        server, server_thread = start_oversized_header_server()
+        try:
+            with self.assertRaisesRegex(common.ContractError, "response headers exceeded the size limit"):
+                common.bounded_request(
+                    "GET",
+                    f"http://127.0.0.1:{server.server_port}/headers",
+                    headers={"Accept": "application/json"},
+                    data=None,
+                    timeout=2.0,
+                    max_response_bytes=1024,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
 
     def test_curl_transport_rejects_header_config_injection(self) -> None:
         with self.assertRaisesRegex(common.ContractError, "control characters"):
@@ -817,13 +907,14 @@ class OperationalContractTests(unittest.TestCase):
         with mock.patch.object(sys, "stderr", stderr):
             heartbeat.start()
             heartbeat._thread.join(timeout=1)
-            with self.assertRaises(operational_orchestrate.ContractError):
+            with self.assertRaises(operational_orchestrate.ContractError) as raised:
                 heartbeat.stop()
 
         event = stderr.getvalue()
         self.assertIn('"event": "manager_heartbeat_failed"', event)
         self.assertIn('"errorType": "ContractError"', event)
         self.assertNotIn(secret, event)
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_heartbeat_accepts_a_progress_response_lost_after_commit(self) -> None:
         lease = heartbeat_lease()

@@ -80,7 +80,7 @@ class Heartbeat:
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:
-            raise ContractError(f"manager heartbeat failed: {self._error}")
+            raise ContractError(f"manager heartbeat failed ({type(self._error).__name__})") from None
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):

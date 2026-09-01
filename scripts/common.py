@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import ssl
 import subprocess
@@ -65,6 +66,9 @@ class OidcHttpRequestError(HttpRequestError):
         return self.status == 429 or self.status >= 500
 
 
+CURL_HEADER_LIMIT = 32_768
+
+
 def _curl_quote(value: str) -> str:
     require("\x00" not in value and "\r" not in value and "\n" not in value, "curl option contains control characters")
     return f'"{value.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"'
@@ -76,18 +80,76 @@ def _write_private(path: Path, payload: bytes) -> None:
         handle.write(payload)
 
 
-def _parse_curl_headers(raw: bytes) -> dict[str, str]:
-    require(len(raw) <= 131_072, "trusted endpoint response headers exceeded the size limit")
+def _parse_curl_headers(raw: bytes) -> tuple[int, dict[str, str]]:
+    require(len(raw) <= CURL_HEADER_LIMIT, "trusted endpoint response headers exceeded the size limit")
+    status = 0
     headers: dict[str, str] = {}
     for line in raw.replace(b"\r\n", b"\n").split(b"\n"):
         if line.startswith(b"HTTP/"):
+            match = re.match(rb"^HTTP/\S+\s+([0-9]{3})(?:\s|$)", line)
+            if match is not None:
+                status = int(match.group(1))
             headers = {}
             continue
         if not line or b":" not in line:
             continue
         key, value = line.split(b":", 1)
         headers[key.decode("iso-8859-1").strip()] = value.decode("iso-8859-1").strip()
-    return headers
+    return status, headers
+
+
+def _terminate_curl(process: Any) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=0.1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _read_curl_pipes(
+    process: Any,
+    deadline: float,
+    max_response_bytes: int,
+) -> tuple[int, bytes, bytes]:
+    require(process.stdout is not None and process.stderr is not None, "curl response pipes are unavailable")
+    body = bytearray()
+    response_headers = bytearray()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, (body, max_response_bytes, "response"))
+    selector.register(process.stderr, selectors.EVENT_READ, (response_headers, CURL_HEADER_LIMIT, "response headers"))
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
+            events = selector.select(remaining)
+            if not events:
+                raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
+            for key, _ in events:
+                target, limit, label = key.data
+                chunk = os.read(key.fd, min(65_536, limit + 1 - len(target)))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                target.extend(chunk)
+                require(len(target) <= limit, f"trusted endpoint {label} exceeded the size limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise TransientRequestError("trusted endpoint request exceeded its absolute deadline") from exc
+        return returncode, bytes(body), bytes(response_headers)
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+        _terminate_curl(process)
 
 
 def bounded_request(
@@ -112,11 +174,7 @@ def bounded_request(
         root = Path(temporary)
         os.chmod(root, 0o700)
         request_path = root / "request.bin"
-        response_path = root / "response.bin"
-        headers_path = root / "response.headers"
         config_path = root / "curl.conf"
-        _write_private(response_path, b"")
-        _write_private(headers_path, b"")
         if data is not None:
             require(isinstance(data, bytes), "trusted endpoint request body is invalid")
             _write_private(request_path, data)
@@ -127,16 +185,13 @@ def bounded_request(
             raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
         config = [
             "silent",
-            "show-error",
             "fail",
             f"request = {_curl_quote(method)}",
             f"url = {_curl_quote(url)}",
             'proto = "=http,https"',
             f"max-time = {_curl_quote(f'{remaining:.6f}')}",
             f"max-filesize = {_curl_quote(str(max_response_bytes))}",
-            f"output = {_curl_quote(str(response_path))}",
-            f"dump-header = {_curl_quote(str(headers_path))}",
-            'write-out = "%{http_code}"',
+            'dump-header = "/dev/stderr"',
         ]
         for key, value in headers.items():
             require(
@@ -154,33 +209,26 @@ def bounded_request(
         if process_timeout <= 0.001:
             raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [curl, "--disable", "--config", str(config_path)],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 env={"LC_ALL": "C"},
-                timeout=process_timeout,
-                check=False,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise TransientRequestError("trusted endpoint request exceeded its absolute deadline") from exc
         except OSError as exc:
             raise TransientRequestError("trusted endpoint request transport could not start") from exc
 
-        status_text = result.stdout.decode("ascii", errors="ignore").strip()
-        status = int(status_text) if re.fullmatch(r"[0-9]{3}", status_text) else 0
-        if result.returncode == 22 and 400 <= status <= 599:
+        returncode, raw, raw_headers = _read_curl_pipes(process, deadline, max_response_bytes)
+        status, response_headers = _parse_curl_headers(raw_headers)
+        if returncode == 22 and 400 <= status <= 599:
             raise HttpRequestError(status, f"HTTP {status} from trusted endpoint")
-        if result.returncode == 28:
+        if returncode == 28:
             raise TransientRequestError("trusted endpoint request exceeded its absolute deadline")
-        if result.returncode == 63:
+        if returncode == 63:
             raise ContractError("trusted endpoint response exceeded the size limit")
-        if result.returncode != 0:
-            raise TransientRequestError(f"trusted endpoint request transport failed with exit {result.returncode}")
+        if returncode != 0:
+            raise TransientRequestError(f"trusted endpoint request transport failed with exit {returncode}")
         require(100 <= status <= 599, "trusted endpoint returned an invalid HTTP status")
-        require(response_path.stat().st_size <= max_response_bytes, "trusted endpoint response exceeded the size limit")
-        raw = response_path.read_bytes()
-        response_headers = _parse_curl_headers(headers_path.read_bytes())
         return status, response_headers, raw
 
 
