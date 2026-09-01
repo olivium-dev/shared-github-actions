@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,13 @@ FORBIDDEN = (
 )
 IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
 SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+COROOT_NODE_AGENT_IMAGE = (
+    "ghcr.io/coroot/coroot-node-agent:1.35.8@"
+    "sha256:aa14e9ea552ccda55ca31fe7a7f03b0f743f00c20d9971537cd4a4d85f4146d7"
+)
+COROOT_COLLECTOR_ENDPOINT = "https://coroot-staging.fds-3.space"
+COROOT_CONTAINER_NAME = "coroot-ephemeral-node-agent"
+LEGACY_FAKE_VOICE_COMMIT = "8f76393982e224306a30a067636109d3573f2f8b"
 POSTGRES_DATABASES = {
     "jeeb-state-service": "jeeb_state_staging",
     "user-management": "jeeb-user-management_staging",
@@ -386,6 +394,7 @@ def transformed_environment(
     public_hostname: str,
     private_ip: str,
     gateway_routes: list[dict[str, Any]],
+    openai_api_key: str = "",
 ) -> dict[str, str]:
     service_id = service["id"]
     environment: dict[str, str] = {}
@@ -457,9 +466,13 @@ def transformed_environment(
 
     if service_id == "voice-transcription-service":
         environment.pop("OPENAI_API_KEY", None)
-        environment["ENVIRONMENT"] = "production"
-        environment["OPENAI_API_KEY_FILE"] = "/run/secrets/openai-ephemeral-sandbox-api-key"
-        environment["WHISPER_FAKE_TRANSCRIBE"] = "0"
+        if openai_api_key:
+            environment["ENVIRONMENT"] = "production"
+            environment["OPENAI_API_KEY_FILE"] = "/run/secrets/openai-ephemeral-sandbox-api-key"
+            environment["WHISPER_FAKE_TRANSCRIBE"] = "0"
+        else:
+            environment.pop("OPENAI_API_KEY_FILE", None)
+            environment["WHISPER_FAKE_TRANSCRIBE"] = "1"
 
     if service_id == "realtime-comunication-service":
         environment["PHX_HOST"] = public_hostname
@@ -521,6 +534,166 @@ def ensure_volume(name: str, lease_id: str, lock_hash: str, deployment_id: str) 
     if docker("volume", "inspect", name, capture=True, check=False).returncode == 0:
         return
     docker("volume", "create", *labels(lease_id, lock_hash, deployment_id), name)
+
+
+def write_restricted_secret(path: Path, value: str) -> None:
+    payload = value.encode()
+    if path.exists():
+        metadata = path.lstat()
+        require(
+            stat.S_ISREG(metadata.st_mode)
+            and not path.is_symlink()
+            and metadata.st_uid == os.geteuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o400,
+            "Coroot credential file has unsafe ownership or permissions",
+        )
+        require(secrets.compare_digest(path.read_bytes(), payload), "Coroot credential file does not match")
+        return
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            metadata = os.fstat(handle.fileno())
+            require(
+                metadata.st_uid == os.geteuid() and stat.S_IMODE(metadata.st_mode) == 0o400,
+                "Coroot credential file was not created securely",
+            )
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def wait_coroot_node_agent(api_key: str, timeout: int = 90) -> None:
+    deadline = time.monotonic() + timeout
+    last = "container has not started"
+    while time.monotonic() < deadline:
+        inspected = docker("container", "inspect", COROOT_CONTAINER_NAME, capture=True, check=False)
+        if inspected.returncode != 0:
+            time.sleep(3)
+            continue
+        try:
+            rows = json.loads(inspected.stdout)
+        except json.JSONDecodeError as exc:
+            raise DeployError("Coroot container inspection returned invalid JSON") from exc
+        require(isinstance(rows, list) and len(rows) == 1, "Coroot container inspection is incomplete")
+        row = rows[0]
+        serialized = json.dumps(row, sort_keys=True)
+        require(api_key not in serialized, "Coroot API key leaked into Docker metadata")
+        require(row["Config"]["Image"] == COROOT_NODE_AGENT_IMAGE, "Coroot agent image is not pinned")
+        require(row["HostConfig"]["Privileged"] is True, "Coroot agent is not privileged")
+        require(row["HostConfig"]["PidMode"] == "host", "Coroot agent cannot see host processes")
+        require(not row["HostConfig"].get("PortBindings"), "Coroot agent publishes a host port")
+        if row["State"]["Running"] is not True:
+            last = row["State"].get("Status", "not running")
+            time.sleep(3)
+            continue
+        address = row["NetworkSettings"]["IPAddress"]
+        require(isinstance(address, str) and address, "Coroot agent has no private container address")
+        try:
+            with urllib.request.urlopen(f"http://{address}:80/metrics", timeout=5) as response:
+                metrics = response.read(2_000_000)
+            require(b"node_agent_info" in metrics, "Coroot agent metrics are unavailable")
+            return
+        except (urllib.error.URLError, TimeoutError, DeployError) as exc:
+            last = str(exc)
+            time.sleep(3)
+    raise DeployError(f"Coroot node agent did not become ready: {last}")
+
+
+def deploy_coroot_node_agent(
+    *,
+    state_dir: Path,
+    api_key: str,
+    lease_id: str,
+    lock_hash: str,
+    deployment_id: str,
+) -> None:
+    request = urllib.request.Request(
+        f"{COROOT_COLLECTOR_ENDPOINT}/health",
+        headers={"User-Agent": "olivium-jeeb-ephemeral-agent/1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            require(response.status == 200, "Coroot collector health check failed")
+    except urllib.error.URLError as exc:
+        raise DeployError("Coroot collector is unreachable from the lease") from exc
+    authenticated_request = urllib.request.Request(
+        f"{COROOT_COLLECTOR_ENDPOINT}/v1/config",
+        headers={
+            "User-Agent": "olivium-jeeb-ephemeral-agent/1",
+            "X-Api-Key": api_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(authenticated_request, timeout=15) as response:
+            require(response.status == 200, "Coroot collector rejected the protected API key")
+            response.read(2_000_000)
+    except urllib.error.URLError as exc:
+        raise DeployError("Coroot collector rejected the protected API key") from exc
+
+    secret_dir = state_dir / "coroot"
+    secret_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(secret_dir, 0o700)
+    key_path = secret_dir / "api-key"
+    write_restricted_secret(key_path, api_key)
+
+    if docker("container", "inspect", COROOT_CONTAINER_NAME, capture=True, check=False).returncode == 0:
+        wait_coroot_node_agent(api_key)
+        return
+
+    volume = f"jeeb-eph-{lease_id}-coroot-agent-data"
+    ensure_volume(volume, lease_id, lock_hash, deployment_id)
+    docker("pull", COROOT_NODE_AGENT_IMAGE, timeout=1800)
+    entrypoint = (
+        'api_key="$(cat /run/secrets/coroot-api-key)"; '
+        'test -n "$api_key"; export COROOT_API_KEY="$api_key"; unset api_key; '
+        "exec /usr/bin/coroot-node-agent "
+        '--collector-endpoint="$COROOT_COLLECTOR_ENDPOINT" '
+        "--cgroupfs-root=/host/sys/fs/cgroup --wal-dir=/data"
+    )
+    docker(
+        "run",
+        "--detach",
+        "--name",
+        COROOT_CONTAINER_NAME,
+        "--restart",
+        "unless-stopped",
+        "--privileged",
+        "--pid",
+        "host",
+        "--cpus",
+        "0.75",
+        "--memory",
+        "768m",
+        *labels(lease_id, lock_hash, deployment_id, "coroot-node-agent"),
+        "--env",
+        f"COROOT_COLLECTOR_ENDPOINT={COROOT_COLLECTOR_ENDPOINT}",
+        "--log-driver",
+        "json-file",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
+        "--mount",
+        "type=bind,source=/sys/kernel/tracing,target=/sys/kernel/tracing",
+        "--mount",
+        "type=bind,source=/sys/kernel/debug,target=/sys/kernel/debug",
+        "--mount",
+        "type=bind,source=/sys/fs/cgroup,target=/host/sys/fs/cgroup,readonly",
+        "--mount",
+        f"type=bind,source={key_path},target=/run/secrets/coroot-api-key,readonly",
+        "--mount",
+        f"type=volume,source={volume},target=/data",
+        "--entrypoint",
+        "/bin/sh",
+        COROOT_NODE_AGENT_IMAGE,
+        "-ec",
+        entrypoint,
+        timeout=1800,
+    )
+    wait_coroot_node_agent(api_key)
 
 
 def create_infrastructure(
@@ -993,8 +1166,7 @@ def materialize_mounts(
             }
         )
 
-    if service_id == "voice-transcription-service":
-        require(openai_api_key, "ephemeral OpenAI credential is unavailable")
+    if service_id == "voice-transcription-service" and openai_api_key:
         name = f"{prefix}-voice-transcription-service-openai"
         create_secret(name, openai_api_key.encode(), lease_id, lock_hash, deployment_id)
         secret_mounts.append(
@@ -1059,6 +1231,7 @@ def create_application(
         public_hostname=public_hostname,
         private_ip=private_ip,
         gateway_routes=catalog["gatewayRouting"],
+        openai_api_key=openai_api_key,
     )
     secret_mounts, config_mounts = materialize_mounts(
         template,
@@ -1205,6 +1378,24 @@ def validate_config(config: dict[str, Any], catalog: dict[str, Any]) -> None:
         raise DeployError(str(exc)) from exc
 
 
+def validate_openai_credential(config: dict[str, Any], openai_api_key: Any) -> str:
+    require(isinstance(openai_api_key, str), "ephemeral OpenAI credential is invalid")
+    if openai_api_key:
+        require(
+            20 <= len(openai_api_key) <= 4096
+            and openai_api_key == openai_api_key.strip()
+            and openai_api_key.isprintable()
+            and not any(character.isspace() for character in openai_api_key),
+            "ephemeral OpenAI credential is invalid",
+        )
+    voice_service = next(item for item in config["services"] if item["id"] == "voice-transcription-service")
+    require(
+        bool(openai_api_key) or voice_service["commit"] == LEGACY_FAKE_VOICE_COMMIT,
+        "non-legacy voice deployment requires the protected OpenAI credential",
+    )
+    return openai_api_key
+
+
 def deploy(args: argparse.Namespace) -> None:
     require(os.geteuid() == 0, "guest deployment must run as root")
     config = load_json(args.config)
@@ -1238,6 +1429,15 @@ def deploy(args: argparse.Namespace) -> None:
         for item in sorted(config["webApplications"], key=lambda row: row["id"])
     ]
     require(lock.get("webApplications") == expected_web_applications, "deployment lock web applications mismatch")
+    require(
+        lock.get("observability")
+        == {
+            "provider": "coroot",
+            "nodeAgentImage": COROOT_NODE_AGENT_IMAGE,
+            "collectorEndpoint": COROOT_COLLECTOR_ENDPOINT,
+        },
+        "deployment lock observability contract mismatch",
+    )
     require(SAFE_ID_RE.fullmatch(args.lease_id) is not None, "invalid lease ID")
     public_hostname = f"eph-{args.lease_id}.{args.zone}"
     try:
@@ -1259,6 +1459,7 @@ def deploy(args: argparse.Namespace) -> None:
     token = credentials.get("ghcrToken")
     super_login_passcode = credentials.get("superLoginPasscode")
     openai_api_key = credentials.get("openAiApiKey")
+    coroot_api_key = credentials.get("corootApiKey")
     require(isinstance(actor, str) and actor and isinstance(token, str) and len(token) >= 20, "GHCR credentials missing")
     require(
         isinstance(super_login_passcode, str)
@@ -1267,13 +1468,14 @@ def deploy(args: argparse.Namespace) -> None:
         and super_login_passcode.isprintable(),
         "ephemeral super-login passcode missing",
     )
+    openai_api_key = validate_openai_credential(config, openai_api_key)
     require(
-        isinstance(openai_api_key, str)
-        and 20 <= len(openai_api_key) <= 4096
-        and openai_api_key == openai_api_key.strip()
-        and openai_api_key.isprintable()
-        and not any(character.isspace() for character in openai_api_key),
-        "ephemeral OpenAI credential missing",
+        isinstance(coroot_api_key, str)
+        and 20 <= len(coroot_api_key) <= 4096
+        and coroot_api_key == coroot_api_key.strip()
+        and coroot_api_key.isprintable()
+        and not any(character.isspace() for character in coroot_api_key),
+        "Coroot API key missing",
     )
     docker("login", "ghcr.io", "-u", actor, "--password-stdin", stdin=token.encode())
 
@@ -1282,6 +1484,14 @@ def deploy(args: argparse.Namespace) -> None:
     lock_path = state_dir / "deployment-lock.json"
     lock_path.write_bytes(canonical(lock) + b"\n")
     os.chmod(lock_path, 0o600)
+
+    deploy_coroot_node_agent(
+        state_dir=state_dir,
+        api_key=coroot_api_key,
+        lease_id=args.lease_id,
+        lock_hash=lock_hash,
+        deployment_id=args.deployment_id,
+    )
 
     postgres_password = secrets.token_urlsafe(32)
     mongo_password = secrets.token_urlsafe(32)
@@ -1397,6 +1607,7 @@ def deploy(args: argparse.Namespace) -> None:
                 "serviceCount": 24,
                 "webApplicationCount": 1,
                 "leaseId": args.lease_id,
+                "corootNodeAgent": "healthy",
                 "seedData": counts,
             },
             sort_keys=True,

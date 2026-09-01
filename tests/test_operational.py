@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -141,13 +142,18 @@ class OperationalContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("super_login_passcode:\n        required: true", workflow)
-        self.assertIn("openai_api_key:\n        required: true", workflow)
+        self.assertIn("openai_api_key:\n        required: false", workflow)
+        self.assertIn("coroot_api_key:\n        required: true", workflow)
         self.assertIn(
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}",
             workflow,
         )
         self.assertIn(
             "JEEB_EPHEMERAL_OPENAI_API_KEY: ${{ secrets.openai_api_key }}",
+            workflow,
+        )
+        self.assertIn(
+            "JEEB_EPHEMERAL_COROOT_API_KEY: ${{ secrets.coroot_api_key }}",
             workflow,
         )
 
@@ -157,6 +163,7 @@ class OperationalContractTests(unittest.TestCase):
             "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
             "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
             "JEEB_EPHEMERAL_OPENAI_API_KEY": "sk-ephemeral-test-key-not-real",
+            "JEEB_EPHEMERAL_COROOT_API_KEY": "coroot-ephemeral-test-key-not-real",
         }
         with mock.patch.dict(os.environ, valid, clear=True):
             self.assertEqual(
@@ -165,6 +172,7 @@ class OperationalContractTests(unittest.TestCase):
                     valid["JEEB_EPHEMERAL_STAGE_TEMPLATE_B64"],
                     valid["JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE"],
                     valid["JEEB_EPHEMERAL_OPENAI_API_KEY"],
+                    valid["JEEB_EPHEMERAL_COROOT_API_KEY"],
                 ),
                 operational_orchestrate.protected_deployment_credentials(),
             )
@@ -172,6 +180,10 @@ class OperationalContractTests(unittest.TestCase):
         with mock.patch.dict(os.environ, invalid, clear=True):
             with self.assertRaisesRegex(operational_orchestrate.ContractError, "passcode is unavailable"):
                 operational_orchestrate.protected_deployment_credentials()
+
+        legacy = {**valid, "JEEB_EPHEMERAL_OPENAI_API_KEY": ""}
+        with mock.patch.dict(os.environ, legacy, clear=True):
+            self.assertEqual("", operational_orchestrate.protected_deployment_credentials()[3])
 
     def test_manager_get_retries_a_transient_read_timeout(self) -> None:
         client = manager_client.ManagerClient(
@@ -294,6 +306,7 @@ class OperationalContractTests(unittest.TestCase):
                         "JEEB_EPHEMERAL_STAGE_TEMPLATE_B64": "x" * 100,
                         "JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE": "ephemeral-only-passcode",
                         "JEEB_EPHEMERAL_OPENAI_API_KEY": "sk-ephemeral-test-key-not-real",
+                        "JEEB_EPHEMERAL_COROOT_API_KEY": "coroot-ephemeral-test-key-not-real",
                         "GITHUB_ACTOR": "tester",
                     },
                 ),
@@ -317,6 +330,56 @@ class OperationalContractTests(unittest.TestCase):
             self.assertIn("operational_seed.py", install)
             self.assertEqual("ephemeral-only-passcode", guest_credentials["superLoginPasscode"])
             self.assertEqual("sk-ephemeral-test-key-not-real", guest_credentials["openAiApiKey"])
+            self.assertEqual("coroot-ephemeral-test-key-not-real", guest_credentials["corootApiKey"])
+
+    def test_coroot_agent_is_pinned_privileged_private_and_secret_file_backed(self) -> None:
+        api_key = "coroot-ephemeral-test-key-not-real"
+        completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+        running = {
+            "Config": {"Image": operational_guest.COROOT_NODE_AGENT_IMAGE, "Env": []},
+            "HostConfig": {"Privileged": True, "PidMode": "host", "PortBindings": None},
+            "State": {"Running": True, "Status": "running"},
+            "NetworkSettings": {"IPAddress": "172.17.0.2"},
+        }
+        calls: list[tuple] = []
+
+        def fake_docker(*arguments: str, **kwargs: object) -> SimpleNamespace:
+            calls.append(arguments)
+            if arguments[:2] == ("container", "inspect"):
+                if sum(1 for call in calls if call[:2] == ("container", "inspect")) == 1:
+                    return completed
+                return SimpleNamespace(returncode=0, stdout=json.dumps([running]).encode(), stderr=b"")
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        with tempfile.TemporaryDirectory() as temporary_name:
+            state_dir = Path(temporary_name)
+            with (
+                mock.patch.object(operational_guest, "docker", side_effect=fake_docker),
+                mock.patch.object(operational_guest.urllib.request, "urlopen") as urlopen,
+            ):
+                urlopen.return_value.__enter__.return_value.status = 200
+                urlopen.return_value.__enter__.return_value.read.return_value = b"node_agent_info 1\n"
+                operational_guest.deploy_coroot_node_agent(
+                    state_dir=state_dir,
+                    api_key=api_key,
+                    lease_id="bright-pikachu-42",
+                    lock_hash="a" * 64,
+                    deployment_id="jeeb-gh-1-1",
+                )
+
+            key_path = state_dir / "coroot" / "api-key"
+            self.assertEqual(api_key, key_path.read_text())
+            self.assertEqual(0o400, stat.S_IMODE(key_path.stat().st_mode))
+            operational_guest.write_restricted_secret(key_path, api_key)
+
+        run_call = next(call for call in calls if call and call[0] == "run")
+        serialized = " ".join(run_call)
+        self.assertIn(operational_guest.COROOT_NODE_AGENT_IMAGE, run_call)
+        self.assertIn("--privileged", run_call)
+        self.assertIn("host", run_call)
+        self.assertNotIn(api_key, serialized)
+        self.assertNotIn("--publish", run_call)
+        self.assertIn("/run/secrets/coroot-api-key", serialized)
 
     def test_seed_data_is_dynamic_strict_and_bound_to_the_lock(self) -> None:
         config = operational_config()
@@ -753,6 +816,7 @@ class OperationalContractTests(unittest.TestCase):
             public_hostname="eph-test.fds-8.space",
             private_ip="192.168.2.160",
             gateway_routes=[],
+            openai_api_key="sk-ephemeral-test-key-not-real",
         )
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertEqual("production", environment["ENVIRONMENT"])
@@ -783,6 +847,20 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual("65532", mounts[0]["gid"])
         self.assertEqual(0o400, mounts[0]["mode"])
 
+        fake_environment = operational_guest.transformed_environment(
+            service,
+            template_service,
+            postgres_password="postgres-password",
+            mongo_password="mongo-password",
+            super_login_passcode="ephemeral-only-passcode",
+            public_hostname="eph-test.fds-8.space",
+            private_ip="192.168.2.160",
+            gateway_routes=[],
+        )
+        self.assertEqual("1", fake_environment["WHISPER_FAKE_TRANSCRIBE"])
+        self.assertNotIn("OPENAI_API_KEY", fake_environment)
+        self.assertNotIn("OPENAI_API_KEY_FILE", fake_environment)
+
     def test_guest_config_requires_exactly_the_catalog_services(self) -> None:
         config = operational_config()
         config["apiVersion"] = "olivium.dev/jeeb-operational-ephemeral/v1"
@@ -793,6 +871,20 @@ class OperationalContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(operational_guest.DeployError, "exactly 24"):
             operational_guest.validate_config(config, catalog)
+
+    def test_only_the_exact_legacy_voice_revision_may_run_without_openai(self) -> None:
+        config = operational_config()
+        voice = next(item for item in config["services"] if item["id"] == "voice-transcription-service")
+        voice["commit"] = operational_guest.LEGACY_FAKE_VOICE_COMMIT
+        self.assertEqual("", operational_guest.validate_openai_credential(config, ""))
+
+        voice["commit"] = "ac8943b5be33ae65ad44263b803d486bb09c5f9e"
+        with self.assertRaisesRegex(operational_guest.DeployError, "non-legacy voice"):
+            operational_guest.validate_openai_credential(config, "")
+        self.assertEqual(
+            "sk-ephemeral-test-key-not-real",
+            operational_guest.validate_openai_credential(config, "sk-ephemeral-test-key-not-real"),
+        )
 
 
 if __name__ == "__main__":

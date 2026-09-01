@@ -31,6 +31,8 @@ on:
       super_login_passcode:
         required: true
       openai_api_key:
+        required: false
+      coroot_api_key:
         required: true
     outputs:
       lease_id:
@@ -117,6 +119,7 @@ jobs:
           JEEB_EPHEMERAL_GHCR_TOKEN: ${{ secrets.ghcr_token }}
           JEEB_EPHEMERAL_SUPER_LOGIN_PASSCODE: ${{ secrets.super_login_passcode }}
           JEEB_EPHEMERAL_OPENAI_API_KEY: ${{ secrets.openai_api_key }}
+          JEEB_EPHEMERAL_COROOT_API_KEY: ${{ secrets.coroot_api_key }}
           MANAGER_URL: https://ephemeral.fds-8.space
           MANAGER_AUDIENCE: https://ephemeral.fds-8.space/api/automation/v1
           EXPECTED_JOB_WORKFLOW_REF: ${{ inputs.expected_job_workflow_ref }}
@@ -171,6 +174,7 @@ jobs:
             echo '| Item | Value |'
             echo '|---|---|'
             echo "| Status | **24 Jeeb services and Jeeb CMS validated** |"
+            echo "| Monitoring | **Lease-local Coroot eBPF agent validated** |"
             echo "| Jeeb CMS | [$HTTPS_URL]($HTTPS_URL) |"
             echo "| CMS login | [$HTTPS_URL/login]($HTTPS_URL/login) |"
             echo "| Health | [$HTTPS_URL/health/ready]($HTTPS_URL/health/ready) |"
